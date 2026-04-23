@@ -1,0 +1,1522 @@
+//@version=6
+float STRAT_COMMISSION = 0.06
+strategy("Diamond Sentinel V10", overlay=true, commission_type=strategy.commission.percent, commission_value=STRAT_COMMISSION, slippage=3, pyramiding=0, initial_capital=10000, currency=currency.USD, max_bars_back=500, margin_long=0, margin_short=0, process_orders_on_close=false)
+
+// ZENITH MASTER CONTRACT V1
+string ZENITH_CONTRACT_V1 = "ZENITH_CONTRACT_V1"
+
+// [SOURCE: ID_00779 | WR: 60.9% | PF: 2.051171 | Trades: 23 | Eq: 10019.44]
+// 
+// SECTION: PRIMARY CONTROLS (Your Wish )
+// 
+f_risk_long = input.float(4, "Risk % (Long)", step=0.1, group="Risk Management")
+f_risk_short = input.float(4, "Risk % (Short)", step=0.1, group="Risk Management")
+float i_risk_long   = f_risk_long / 100.0
+float i_risk_short  = f_risk_short / 100.0
+
+// Exit Controls
+i_rsi_ex_l = input.float(83.95614, "Exit RSI (Long)", group="Exits")
+i_rsi_ex_s = input.float(16.165475, "Exit RSI (Short)", group="Exits")
+i_use_exh_exit = input.bool(true, "Use Exhaustion Exit", group="Exits")
+
+// Diagnostic & Forensic (Usually Hidden)
+i_export_data       = input.bool(true, "Export DATA Channel (D-Rows)", group="Advanced/Forensic")
+i_export_ledger     = input.bool(true, "Export LEDGER Channel (Meta/H/T/Sync)", group="Advanced/Forensic")
+// Export profile:
+// - TRADES (legacy): full H/T + closing deck; samples D under TV log cap (v2_hdeck).
+// - OHLCV_PASS: full contiguous D only (ohlcv_pass_v1, d_stride=1); no H/T — use for clinical D-stream / certification D.
+// - LEDGER_PASS: sovereign ledger stream (ledger_pass_v1): no D rows; handshake + optional H + T + deck (certification ledger).
+i_export_profile    = input.string("TRADES", "Export Profile", options=["TRADES", "OHLCV_PASS", "LEDGER_PASS"], group="Advanced/Forensic")
+i_ohlcv_pass        = input.int(1, "OHLCV Pass (1..N)", minval=1, group="Advanced/Forensic")
+// Log line budget is fixed internally (~20k Pine log lines in our setup). D-stream cap + stride adapt so
+// EXPORT_CHECKPOINT / H flush / T / EXPORT_DONE stay inside the buffer — no manual sliders.
+bool _want_ohlcv   = i_export_profile == "OHLCV_PASS"
+bool _want_ledpass = i_export_profile == "LEDGER_PASS"
+// Plan Fix 1: explicit legacy profile (TRADES). Options are exhaustive; else-branches below assume legacy when not OHLCV/LEDGER.
+bool _want_trades_legacy = i_export_profile == "TRADES"
+bool exp_export_data   = _want_ohlcv ? true : (_want_ledpass ? false : i_export_data)
+bool exp_export_ledger = _want_ohlcv ? false : (_want_ledpass ? true : i_export_ledger)
+bool exp_export_logs   = exp_export_data or exp_export_ledger
+bool  i_show_diagnostic = input.bool(true, "Show Zero-Trade Diagnostic Table", group="Advanced/Forensic")
+i_debug_mode        = input.bool(false, "Enable Per-Bar Sync Logs (DBGS)", group="Advanced/Forensic")
+i_debug_snapshot    = input.bool(false, "Enable Debug Snapshot Logging (uses log lines)", group="Advanced/Forensic")
+
+// --- TRACK A STEP 1: DUAL-GATING FORENSIC INPUTS ---
+i_mode_select = input.string("Forensic", "Execution Mode", options=["Sweep", "Forensic"], group="Advanced/Forensic")
+i_lg_time     = input.bool(false, "Enable Time Window Filter (Premium: off=all bars in range; on=segment by dates below)", group="Advanced/Forensic")
+i_lg_idx      = input.bool(false, "Enable Bar Index Filter", group="Advanced/Forensic")
+// input.time defval must be const int ms — `timestamp(...)` is only simple int (CE10123).
+// 1767225600000 = 2026-01-01T00:00:00.000Z | 1798761599000 = 2026-12-31T23:59:59.000Z
+i_t_start     = input.time(1767225600000, "Forensic Start Time", group="Advanced/Forensic")
+i_t_end       = input.time(1798761599000, "Forensic End Time", group="Advanced/Forensic")
+i_b_start     = input.int(0, "Forensic Start Bar Index", group="Advanced/Forensic")
+i_b_end       = input.int(99999, "Forensic End Bar Index", group="Advanced/Forensic")
+
+
+// 
+// SECTION: ADVANCED TUNING (Overridden when PRO is ON)
+// 
+i_z_long_zone = input.float(-1.144855, "Z-Score Long", group="Advanced/Indicator Override")
+i_z_short_zone = input.float(0.822208, "Z-Score Short", group="Advanced/Indicator Override")
+i_rsi_long_mild = input.float(39, "RSI Long Mild", group="Advanced/Indicator Override")
+i_rsi_short_mild = input.float(59, "RSI Short Mild", group="Advanced/Indicator Override")
+i_velocity_high = input.float(0.108762, "Impulse Threshold", group="Advanced/Indicator Override")
+i_nuc_threshold = input.float(3.359073, "NUC Threshold L", group="Advanced/Indicator Override")
+i_nuc_threshold_s = input.float(2.260184, "NUC Threshold S", group="Advanced/Indicator Override")
+i_confluence_min = input.int(1, "Conf Min", group="Advanced/Indicator Override")
+i_mode_a_r = input.float(3.404102, "R-Mult Mode A", group="Advanced/Indicator Override")
+i_sl_atr_mult_long = input.float(2.08342, "SL ATR Mult (Long)", group="Advanced/Indicator Override")
+i_sl_atr_mult_short = input.float(1.997127, "SL ATR Mult (Short)", group="Advanced/Indicator Override")
+f_sl_floor_pct = input.float(1.2795, "SL Floor %", group="Advanced/Indicator Override")
+f_sl_cap_pct = input.float(3.6442, "SL Cap %", group="Advanced/Indicator Override")
+i_sl_floor_pct      = f_sl_floor_pct / 100.0
+i_sl_cap_pct        = f_sl_cap_pct / 100.0
+
+// Trailing Stop Hidden Defaults
+i_trail_activation_long = input.float(1.409305, "Trail Act (L)", group="Advanced/Trail")
+i_trail_activation_short = input.float(1.010188, "Trail Act (S)", group="Advanced/Trail")
+i_trail_lv = input.float(3.56153, "Trail LV", group="Advanced/Trail")
+i_trail_mv = input.float(1.501015, "Trail MV", group="Advanced/Trail")
+i_trail_hv = input.float(-1.323956, "Trail HV", group="Advanced/Trail")
+
+// Filters
+i_use_reversal = input.bool(true, "Mode A: Reversal", group="Filters")
+i_use_continuation = input.bool(true, "Mode B: Continuation", group="Filters")
+bool  i_use_chop_filter   = input.bool(true, "Chop Filter", group="Filters")
+bool  i_use_daily_anchors = input.bool(true, "Use Daily structural anchors", group="Filters")
+i_chop_threshold = input.float(0.171327, "Chop SD", group="Filters")
+float i_max_leverage      = input.float(20.0, "Max Leverage", group="Filters")
+
+// Re-map internal names not in inputs but used in code
+bool i_minimal_test = false
+int i_ema_persist_bars = input.int(4, "EMA Persist Bars", group="Advanced")
+float i_ad_decel = -8.7
+float i_adx_decel_thresh = input.float(-4.696349, "ADX Decel Thresh", group="Advanced")
+float i_emergency_atr_mult = 2.5
+int i_vwap_min_bars_base = 4
+float i_max_z_l = input.float(2.196951, "Max Z Long", group="Advanced")
+float i_max_z_s = input.float(-1.275321, "Max Z Short", group="Advanced")
+int i_min_trend_age_long = input.int(6, "Min Trend Age Long", group="Advanced")
+int i_min_trend_age_short = input.int(3, "Min Trend Age Short", group="Advanced")
+float i_min_adx_z_long = input.float(0.046767, "Min ADX Z Long", group="Advanced")
+float i_min_adx_z_short = input.float(-0.838835, "Min ADX Z Short", group="Advanced")
+float i_min_adx_gate = input.float(-13.337987, "Min ADX Gate", group="Advanced")
+float i_min_vel_gate = input.float(0.200599, "Min Vel Gate", group="Advanced")
+i_use_fixed_qty = false
+i_fixed_qty_val = 1.0
+float i_mode_b_r_long = input.float(3.157737, "Mode B R Long", group="Advanced")
+float i_mode_b_r_short = input.float(3.290059, "Mode B R Short", group="Advanced")
+float i_rsi_long_extreme = input.float(28.438873, "RSI Long Extreme", group="Advanced")
+float i_rsi_short_extreme = input.float(62.360032, "RSI Short Extreme", group="Advanced")
+float i_slip_base = 0.0003
+float i_max_slip_v_m = 2.0
+float i_exh_vel_l = input.float(0, "Exh Vel L", group="Advanced")
+float i_exh_z_l = input.float(0, "Exh Z L", group="Advanced")
+float i_exh_vel_s = input.float(0, "Exh Vel S", group="Advanced")
+float i_exh_z_s = input.float(0, "Exh Z S", group="Advanced")
+bool i_exh_regime = input.bool(false, "Exh Regime", group="Advanced")
+float i_sweep_tol_atr = input.float(0.209062, "Sweep Tol ATR", group="Advanced")
+int i_max_rsi_long = input.int(71, "Max RSI Long", group="Advanced")
+int i_max_rsi_short = input.int(6, "Max RSI Short", group="Advanced")
+float i_velocity_med = input.float(0.07234, "Velocity Med", group="Advanced")
+int i_confluence_min_s = input.int(1, "Conf Min S", group="Advanced")
+float i_min_adx_z_long_override = -2.3
+float i_min_adx_z_short_override = 0.03
+bool i_strict_regime_sync = input.bool(true, "Strict Regime Sync", group="Advanced")
+int i_cd_l = input.int(34, "CD L", group="Advanced")
+int i_cd_s = input.int(28, "CD S", group="Advanced")
+
+// Common Identifiers
+var string ID_L = "Long"
+var string ID_S = "Short"
+var string ENTRY_COMM_L = "ENTRY LONG"
+var string ENTRY_COMM_S = "ENTRY SHORT"
+var table diag_table = na
+
+
+// SECTION L: DIRECT INPUT USAGE (No Override)
+// magic_numbers_Anti_2.py patches input() values directly
+// All variables use the patched inputs - no hardcoded overrides
+v_risk_l = f_risk_long
+v_risk_s = f_risk_short
+v_sl_l = i_sl_atr_mult_long
+v_sl_s = i_sl_atr_mult_short
+v_sl_floor = i_sl_floor_pct
+v_sl_cap = i_sl_cap_pct
+v_mode_a_r = i_mode_a_r
+v_mode_b_r_l = i_mode_b_r_long
+v_mode_b_r_s = i_mode_b_r_short
+v_trail_act_l = i_trail_activation_long
+v_trail_act_s = i_trail_activation_short
+v_trail_lv = i_trail_lv
+v_trail_mv = i_trail_mv
+v_trail_hv = i_trail_hv
+v_nuc_thresh = i_nuc_threshold
+v_nuc_thresh_s = i_nuc_threshold_s
+v_conf_min = int(i_confluence_min)
+v_conf_min_s = int(i_confluence_min_s)
+v_use_a = i_use_reversal
+v_use_b = i_use_continuation
+v_adx_z_l = i_min_adx_z_long
+v_adx_z_s = i_min_adx_z_short
+v_vel_high = i_velocity_high
+v_vel_med = i_velocity_med
+v_chop_threshold = i_chop_threshold
+v_adx_dec = i_adx_decel_thresh
+v_adx_gate = i_min_adx_gate
+v_vel_gate = i_min_vel_gate
+// RSI/Z Exhaustion
+v_rsi_ex_l = i_rsi_ex_l
+v_rsi_ex_s = i_rsi_ex_s
+v_max_rsi_l = i_max_rsi_long
+v_max_rsi_s = i_max_rsi_short
+v_max_z_l = i_max_z_l
+v_max_z_s = i_max_z_s
+v_zl_ign = i_z_long_zone
+v_zs_ign = i_z_short_zone
+v_rl_ign = i_rsi_long_extreme
+v_rs_ign = i_rsi_short_extreme
+v_rsi_l_mild = i_rsi_long_mild
+v_rsi_s_mild = i_rsi_short_mild
+v_cd_l = int(i_cd_l)
+v_cd_s = int(i_cd_s)
+v_age_l = int(i_min_trend_age_long)
+v_age_s = int(i_min_trend_age_short)
+v_sweep_tol = i_sweep_tol_atr
+v_use_chop = i_use_chop_filter
+v_use_exh = i_use_exh_exit
+bool v_min_test = i_minimal_test
+
+// --- VISUAL CONFIRMATION ---
+var table parity_lbl = table.new(position.top_center, 1, 1)
+if barstate.islast
+    table.cell(parity_lbl, 0, 0, "PARITY ACTIVE ID_00779", bgcolor=color.new(color.lime, 20), text_color=color.black, text_size=size.small)
+
+
+// 
+// SECTION A: Base Indicators (computed once, referenced everywhere)
+// 
+
+// ATR with industrial floor (0.1% of price) to match Python parity
+safe_atr       = math.max(nz(ta.atr(14), close * 0.015), close * 0.001)
+// ATR 20-bar SMA
+safe_atr_sma20 = math.max(nz(ta.sma(safe_atr, 20), safe_atr), safe_atr * 0.1)
+
+// New bit-perfect parity ATRs (executed every bar)
+sys_atr14 = ta.atr(14)
+sys_atr20 = ta.atr(20)
+
+// Exponential Moving Averages (trend structure)
+// EMA needs N bars for SMA seed  nz() provides close as fallback during warmup
+sys_ema9   = nz(ta.ema(close, 9), close)      // fast  entry-level momentum
+sys_ema20  = nz(ta.ema(close, 20), close)     // medium  regime detection
+
+// Session & Oscillator
+sys_vwap   = ta.vwap              // intraday anchor  resets daily
+sys_rsi_14 = ta.rsi(close, 14)    // mean-reversion signal for Mode A ignition
+// ADX via ta.dmi()  ta.adx() removed in v6
+[_, _, sys_adx_14] = ta.dmi(14, 14) // Fix 7: Purged dead DI+ and DI- arrays
+
+// 
+// SECTION B: Derived Signals (dimensionless, normalized)
+// 
+
+// IMPORTANT: always stamp UTC explicitly. `time` is an epoch ms; without an explicit timezone,
+// formatting can display exchange/chart timezone while still appending "Z" (mislabel).
+f_epoch_iso(ts) => str.format_time(ts, "yyyy-MM-dd'T'HH:mm:ss'Z'", "UTC")
+
+// IMPULSE: Smoothed, ATR-normalized EMA of returns
+// Measures "Inertia" rather than 1-bar noise. Target: > 1.0 for thrust.
+sys_impulse = ta.ema((close - nz(close[1], close)) / safe_atr, 5)
+velocity    = sys_impulse  // Alias for forensic logging parity
+
+// Z-SCORE: standard deviations from 20-bar mean
+z_mean      = nz(ta.sma(close, 20), close)
+z_stdev     = math.max(nz(ta.stdev(close, 20)), safe_atr * 0.001)
+// --- Forensic State Persistence (Rollback) ---
+// SCHEMA_ID: handshake / H-channel / checkpoints (Zenith v10.27-H2 family).
+var string SCHEMA_ID      = "v10.27-H2"
+// SCHEMA_DATA12: D-row + T-row schema column — must match Optimizer `V10_27_H2_DATA12` / Python DATA12_V1 detector.
+var string SCHEMA_DATA12  = "v10.27-H2-DATA12"
+var float log_z           = na
+var float log_rsi         = na
+var float log_vel         = na
+var float log_atr         = na
+var float log_adx_z       = na
+var int   log_nuc         = na
+var int   log_conf        = na
+var int   log_regime      = na
+var int   log_side        = na
+var string log_mode       = na
+var float snapshot_sl_dist_at_entry = na
+
+sys_z_score = (close - z_mean) / z_stdev
+
+// ADX Z-SCORE & CHOP (Fix: Align with Python)
+sys_adx_sma20 = nz(ta.sma(sys_adx_14, 20), sys_adx_14)
+sys_adx_stdev = math.max(nz(ta.stdev(sys_adx_14, 20)), 0.001)
+float adx_zscore = (sys_adx_14 - sys_adx_sma20) / sys_adx_stdev
+bool is_choppy = nz(ta.stdev(close, 20), 0) < v_chop_threshold * safe_atr
+float vsr_val = 0.0
+// > 0 = strengthening (Mode B filter) | < -0.5 = decelerating (NEUTRAL signal)
+// Cold-start: ADX needs ~34 bars (14 RMA + 20 SMA). na chains to nz(adx_zscore, 0.0) = neutral.
+// Global Indicator Evaluation (Fixed: Moved out of conditionals to prevent na poisoning)
+float adx_sma20 = ta.sma(sys_adx_14, 20)
+float adx_cum   = ta.cum(sys_adx_14) / (bar_index + 1)
+float adx_sd20  = ta.stdev(sys_adx_14, 20)
+
+float adx_mean   = nz(adx_sma20, adx_cum)
+float adx_stdev  = math.max(nz(adx_sd20), safe_atr * 0.001)
+adx_zscore := nz((sys_adx_14 - adx_mean) / adx_stdev, 0.0)
+
+// DEBUG snapshot for Python parity  first ENTRY bar from newlog.csv
+dbg_time = timestamp("UTC", 2025, 1, 27, 6, 0)
+is_dbg_bar = i_debug_snapshot and time == dbg_time
+if is_dbg_bar
+    log.info("DEBUG SNAPSHOT AT: {0}", str.format_time(time, "yyyy-MM-dd HH:mm", syminfo.timezone))
+
+// VWAP SQUEEZE (Chop Filter Logic)
+vwap_sd     = ta.stdev(sys_vwap, 50)
+vwap_sd_avg = ta.sma(vwap_sd, 500)
+vsr_val     := vwap_sd / vwap_sd_avg
+vsr_sd      = ta.stdev(vsr_val, 50)
+is_squeezed = v_use_chop and vsr_sd < v_chop_threshold
+is_choppy   := is_squeezed or adx_zscore < v_adx_dec
+
+// 
+// SECTION C: OBV Dual-Role (fast for ignition, slow for regime)
+// 
+
+// Stdev normalization: nz() inside epsilon floor prevents na poisoning
+sys_obv       = ta.obv
+sys_obv_sma20 = nz(ta.sma(sys_obv, 20), ta.cum(sys_obv) / (bar_index + 1))
+// Fix 9: Hard ATR-based floor to prevent OBV NaN crashes
+obv_stdev     = math.max(nz(ta.stdev(sys_obv, 20)), safe_atr * 0.001)
+
+// FAST: 5-bar ROC  Mode A ignition confirmation (1.25hr lag on 15m)
+sys_obv_roc5    = nz(ta.change(sys_obv, 5) / obv_stdev, 0.0)   // neutral seed during cold-start
+
+// SLOW: 20-bar SMA slope  regime/trend bias (10hr effective lag on 15m)
+sys_obv_slope20 = nz((sys_obv_sma20 - sys_obv_sma20[20]) / obv_stdev, 0.0)
+
+// 
+// SECTION D: Time & Session Helpers
+// 
+
+is_monday = (dayofweek(time, "UTC") == dayofweek.monday)
+is_tuesday_or_later  = (dayofweek(time, "UTC") != dayofweek.monday)
+
+// 
+// SECTION D2: FVG/OB Array Declarations
+// (MUST be declared before Monday purge references them)
+// 
+
+// FVG arrays: max 3 per direction (FIFO). 4 parallel arrays per direction.
+var array<float> fvg_bull_top = array.new<float>(0)
+var array<float> fvg_bull_bot = array.new<float>(0)
+var array<int>   fvg_bull_bar = array.new<int>(0)
+var array<box>   fvg_bull_box = array.new<box>(0)
+
+var array<float> fvg_bear_top = array.new<float>(0)
+var array<float> fvg_bear_bot = array.new<float>(0)
+var array<int>   fvg_bear_bar = array.new<int>(0)
+var array<box>   fvg_bear_box = array.new<box>(0)
+
+// OB arrays: same structure, 200-bar expiry
+var array<float> ob_bull_top = array.new<float>(0)
+var array<float> ob_bull_bot = array.new<float>(0)
+var array<int>   ob_bull_bar = array.new<int>(0)
+var array<box>   ob_bull_box = array.new<box>(0)
+
+var array<float> ob_bear_top = array.new<float>(0)
+var array<float> ob_bear_bot = array.new<float>(0)
+var array<int>   ob_bear_bar = array.new<int>(0)
+var array<box>   ob_bear_box = array.new<box>(0)
+
+// 
+// SECTION D3: Structural Levels (weekly tracking + Monday purge)
+// MUST execute before Section F references active_high/low
+// 
+
+var float prior_week_high   = na
+var float prior_week_low    = na
+var float running_week_high = na
+var float running_week_low  = na
+var float monday_high       = na
+var float monday_low        = na
+var float active_high       = na
+var float active_low        = na
+
+// Monday open: freeze prior week, reset running, purge zones
+if is_monday and not is_monday[1]
+    prior_week_high  := nz(running_week_high, high)
+    prior_week_low   := nz(running_week_low, low)
+    running_week_high := high
+    running_week_low  := low
+
+    // Fix 23: MONDAY PURGE RESTORED (Forensic v10.22)
+    while fvg_bull_top.size() > 0
+        box.delete(fvg_bull_box.shift())
+        fvg_bull_top.shift()
+        fvg_bull_bot.shift()
+        fvg_bull_bar.shift()
+    while fvg_bear_top.size() > 0
+        box.delete(fvg_bear_box.shift())
+        fvg_bear_top.shift()
+        fvg_bear_bot.shift()
+        fvg_bear_bar.shift()
+
+
+// Tuesday 00:00 UTC: freeze Monday range
+if is_tuesday_or_later and not is_tuesday_or_later[1]
+    monday_high := running_week_high
+    monday_low  := running_week_low
+
+// Daily OHLC Tracking (For Dynamic Structural Anchors)
+is_new_day = ta.change(time("D")) != 0
+var float daily_high = na
+var float daily_low  = na
+if is_new_day
+    daily_high := high
+    daily_low  := low
+else
+    daily_high := math.max(nz(daily_high, high), high)
+    daily_low  := math.min(nz(daily_low, low), low)
+
+// Running weekly high/low (updates every bar)
+running_week_high := math.max(nz(running_week_high, high), high)
+running_week_low  := math.min(nz(running_week_low, low), low)
+
+// Active level assignment (Monday Range + Daily Proximity)
+// Fix 24: Use math.min/max correctly for structural sweeps
+if is_monday
+    active_high := nz(prior_week_high, high)
+    active_low  := nz(prior_week_low, low)
+if is_tuesday_or_later
+    // Anchors Tuesday-Sunday: prioritise Monday range but allow Daily sweep confluences
+    active_high := nz(monday_high, nz(prior_week_high, high))
+    active_low  := nz(monday_low, nz(prior_week_low, low))
+    
+    // Near-level boost: if price is nearer to Daily extreme than Monday extreme, use Daily (Dynamic)
+    if i_use_daily_anchors // New toggle (true by default)
+        if math.abs(low - daily_low[1]) < math.abs(low - active_low)
+            active_low := daily_low[1]
+        if math.abs(high - daily_high[1]) < math.abs(high - active_high)
+            active_high := daily_high[1]
+
+// 
+// GARBAGE COLLECTION (runs BEFORE zone creation + collision each bar)
+// Reverse iteration prevents index-shift corruption on removal
+// 
+
+// Fix 2 & 20: Garbage collection throttled to every 3rd bar to save CPU (Forensic v10.22)
+if bar_index % 3 == 0
+    // FVG bull: fill (price traded below bottom) or expiry (50 bars  12.5hr)
+    if fvg_bull_top.size() > 0
+        for i = fvg_bull_top.size() - 1 to 0
+            if low <= fvg_bull_bot.get(i) or (bar_index - fvg_bull_bar.get(i)) > 50
+                box.delete(fvg_bull_box.get(i))
+                fvg_bull_top.remove(i)
+                fvg_bull_bot.remove(i)
+                fvg_bull_bar.remove(i)
+                fvg_bull_box.remove(i)
+    
+    // FVG bear: fill (price traded above top) or expiry
+    if fvg_bear_top.size() > 0
+        for i = fvg_bear_top.size() - 1 to 0
+            if high >= fvg_bear_top.get(i) or (bar_index - fvg_bear_bar.get(i)) > 50
+                box.delete(fvg_bear_box.get(i))
+                fvg_bear_top.remove(i)
+                fvg_bear_bot.remove(i)
+                fvg_bear_bar.remove(i)
+                fvg_bear_box.remove(i)
+    
+    // OB bull: fill or expiry (200 bars  50hr)
+    if ob_bull_top.size() > 0
+        for i = ob_bull_top.size() - 1 to 0
+            if low <= ob_bull_bot.get(i) or (bar_index - ob_bull_bar.get(i)) > 200
+                box.delete(ob_bull_box.get(i))
+                ob_bull_top.remove(i)
+                ob_bull_bot.remove(i)
+                ob_bull_bar.remove(i)
+                ob_bull_box.remove(i)
+    
+    // OB bear: fill or expiry
+    if ob_bear_top.size() > 0
+        for i = ob_bear_top.size() - 1 to 0
+            if high >= ob_bear_top.get(i) or (bar_index - ob_bear_bar.get(i)) > 200
+                box.delete(ob_bear_box.get(i))
+                ob_bear_top.remove(i)
+                ob_bear_bot.remove(i)
+                ob_bear_bar.remove(i)
+                ob_bear_box.remove(i)
+
+// 
+// ZONE CREATION (runs AFTER GC, BEFORE collision)
+// 
+
+// FVG Detection: 3-candle gap pattern with displacement volume filter
+safe_vol_sma = math.max(nz(volume, 0.00001), nz(ta.sma(volume, 20), volume))
+// Fix 10: Use current bar volume for FVG displacement, not delayed volume[1]
+has_displacement_volume = volume > 1.5 * safe_vol_sma
+
+// Bullish FVG: gap between 1-bar-ago low and 3-bars-ago high (Forensic v10.22)
+bull_fvg_detected = low[1] > high[3] and has_displacement_volume
+if bull_fvg_detected
+    fvg_new_top = low[1]   // gap ceiling
+    fvg_new_bot = high[3]  // gap floor
+    if fvg_bull_top.size() >= 3
+        box.delete(fvg_bull_box.shift())
+        fvg_bull_top.shift()
+        fvg_bull_bot.shift()
+        fvg_bull_bar.shift()
+    fvg_bull_top.push(fvg_new_top)
+    fvg_bull_bot.push(fvg_new_bot)
+    fvg_bull_bar.push(bar_index)
+    fvg_bull_box.push(box.new(bar_index - 2, fvg_new_top, bar_index + 50, fvg_new_bot, border_color=color.new(color.green, 60), bgcolor=color.new(color.green, 90)))
+
+// Bearish FVG: gap between 3-bars-ago low and 1-bar-ago high (Forensic v10.22)
+bear_fvg_detected = high[1] < low[3] and has_displacement_volume
+if bear_fvg_detected
+    fvg_new_top = low[3]   // gap ceiling
+    fvg_new_bot = high[1]  // gap floor
+    if fvg_bear_top.size() >= 3
+        box.delete(fvg_bear_box.shift())
+        fvg_bear_top.shift()
+        fvg_bear_bot.shift()
+        fvg_bear_bar.shift()
+    fvg_bear_top.push(fvg_new_top)
+    fvg_bear_bot.push(fvg_new_bot)
+    fvg_bear_bar.push(bar_index)
+    fvg_bear_box.push(box.new(bar_index - 2, fvg_new_top, bar_index + 50, fvg_new_bot, border_color=color.new(color.red, 60), bgcolor=color.new(color.red, 90)))
+
+// OB Detection: opposing candle before displacement move
+// Refined: directional body + close position filter + volume confirmation
+avg_body  = nz(ta.sma(math.abs(close - open), 20), math.abs(close - open))
+
+is_displacement_bull = (close - open) > 2.0 * avg_body and close > (high - (high - low) * 0.25) and volume > 1.5 * safe_vol_sma
+is_displacement_bear = (open - close) > 2.0 * avg_body and close < (low + (high - low) * 0.25) and volume > 1.5 * safe_vol_sma
+
+// Bullish OB: prior bar was bearish, current bar is bullish displacement
+bull_ob_detected = nz(close[1], close) < nz(open[1], open) and is_displacement_bull
+if bull_ob_detected
+    ob_new_top = nz(high[1], high)
+    ob_new_bot = nz(low[1], low)
+    if ob_bull_top.size() >= 3
+        box.delete(ob_bull_box.shift())
+        ob_bull_top.shift()
+        ob_bull_bot.shift()
+        ob_bull_bar.shift()
+    ob_bull_top.push(ob_new_top)
+    ob_bull_bot.push(ob_new_bot)
+    ob_bull_bar.push(bar_index)
+    ob_bull_box.push(box.new(bar_index - 1, ob_new_top, bar_index + 200, ob_new_bot, border_color=color.new(color.teal, 60), bgcolor=color.new(color.teal, 85)))
+
+// Bearish OB: prior bar was bullish, current bar is bearish displacement
+bear_ob_detected = nz(close[1], close) > nz(open[1], open) and is_displacement_bear
+if bear_ob_detected
+    ob_new_top = nz(high[1], high)
+    ob_new_bot = nz(low[1], low)
+    if ob_bear_top.size() >= 3
+        box.delete(ob_bear_box.shift())
+        ob_bear_top.shift()
+        ob_bear_bot.shift()
+        ob_bear_bar.shift()
+    ob_bear_top.push(ob_new_top)
+    ob_bear_bot.push(ob_new_bot)
+    ob_bear_bar.push(bar_index)
+    ob_bear_box.push(box.new(bar_index - 1, ob_new_top, bar_index + 200, ob_new_bot, border_color=color.new(color.orange, 60), bgcolor=color.new(color.orange, 85)))
+
+// 
+// COLLISION DETECTION (runs AFTER GC + creation  only live zones)
+// Fix 21: Added O(1) bounding box filter before triggering the O(n) array scan
+// 
+
+// Bounding box for the current candle + ATR buffer
+float scan_high = high + 0.5 * safe_atr
+float scan_low  = low  - 0.5 * safe_atr
+
+is_fvg_bull = false
+if fvg_bull_top.size() > 0 and scan_low <= fvg_bull_top.max() and scan_high >= fvg_bull_bot.min()
+    for i = 0 to fvg_bull_top.size() - 1
+        if low <= fvg_bull_top.get(i) and high >= fvg_bull_bot.get(i)
+            is_fvg_bull := true
+
+is_fvg_bear = false
+if fvg_bear_top.size() > 0 and scan_low <= fvg_bear_top.max() and scan_high >= fvg_bear_bot.min()
+    for i = 0 to fvg_bear_top.size() - 1
+        if low <= fvg_bear_top.get(i) and high >= fvg_bear_bot.get(i)
+            is_fvg_bear := true
+
+is_in_fvg_zone = is_fvg_bull or is_fvg_bear
+bool is_fvg_bull_lag = is_fvg_bull[1]
+bool is_fvg_bear_lag = is_fvg_bear[1]
+
+is_ob_bull = false
+if ob_bull_top.size() > 0 and scan_low <= ob_bull_top.max() and scan_high >= ob_bull_bot.min()
+    for i = 0 to ob_bull_top.size() - 1
+        if low <= ob_bull_top.get(i) and high >= ob_bull_bot.get(i)
+            is_ob_bull := true
+
+is_ob_bear = false
+if ob_bear_top.size() > 0 and scan_low <= ob_bear_top.max() and scan_high >= ob_bear_bot.min()
+    for i = 0 to ob_bear_top.size() - 1
+        if low <= ob_bear_top.get(i) and high >= ob_bear_bot.get(i)
+            is_ob_bear := true
+
+is_at_order_block = is_ob_bull or is_ob_bear
+bool is_ob_bull_lag = is_ob_bull[1]
+bool is_ob_bear_lag = is_ob_bear[1]
+
+// Monday Range proximity check (0.2  ATR buffer)
+is_at_monday_range = bar_index > 0 and ((low <= active_low + 0.2 * safe_atr) or (high >= active_high - 0.2 * safe_atr))
+bool is_monday_range_lag = is_at_monday_range[1]
+
+// OBV confluence (uses FAST roc5 for entry-level confirmation)
+// Directional: confirms bullish when evaluating longs, bearish when evaluating shorts
+obv_slope_confirms_entry_long  = sys_obv_roc5 > 0
+obv_slope_confirms_entry_short = sys_obv_roc5 < 0
+
+// 
+// SECTION E: Regime State Machine (Step 3b)
+// 
+
+LONG_REGIME  = 1
+SHORT_REGIME = -1
+NEUTRAL      = 0
+var int regime_state = NEUTRAL
+var int regime_age = 0  // bars since last regime state change
+
+// EMA persistence counters: consecutive bars EMA9 above/below EMA20
+// Fix 19: Use safe 'var' bounded strictly by barstate.isconfirmed to prevent repainting
+var int ema9_above_ema20_count = 0
+var int ema9_below_ema20_count = 0
+if barstate.isconfirmed
+    // [FORENSIC INVARIANT]: ema9 == ema20 MUST yield (0,0) in D-row columns r[22],r[23]
+    if sys_ema9 == sys_ema20
+        ema9_above_ema20_count := 0
+        ema9_below_ema20_count := 0
+    else if sys_ema9 > sys_ema20
+        ema9_above_ema20_count += 1
+        ema9_below_ema20_count := 0
+    else
+        ema9_below_ema20_count += 1
+        ema9_above_ema20_count := 0
+
+ema9_gt_ema20_5bars = ema9_above_ema20_count >= i_ema_persist_bars
+ema9_lt_ema20_5bars = ema9_below_ema20_count >= i_ema_persist_bars
+ema_crossed_within_5 = ema9_above_ema20_count < i_ema_persist_bars and ema9_below_ema20_count < i_ema_persist_bars
+
+// Regime transition sub-conditions
+obv_slope20_confirms_long  = sys_obv_slope20 > 0
+obv_slope20_confirms_short = sys_obv_slope20 < 0
+close_vs_vwap_confirms_long  = close > sys_vwap
+close_vs_vwap_confirms_short = close < sys_vwap
+
+// Normal NEUTRAL conditions
+normal_neutral_conditions = ema_crossed_within_5 or (ema9_gt_ema20_5bars and obv_slope20_confirms_short) or (ema9_lt_ema20_5bars and obv_slope20_confirms_long) or adx_zscore < i_adx_decel_thresh
+
+// Hysteresis: impulsive hold timer
+var int hysteresis_countdown = 0
+hysteresis_active = hysteresis_countdown > 0
+hysteresis_bars = 0 // Nuclear Mode: Disabled
+
+//  DECENTRALIZED GUARDS (Architectural Hardening) 
+// Guard 1: Volatility Spike (Safety switch)
+vol_spike_guard = (safe_atr > i_emergency_atr_mult * safe_atr_sma20)
+
+// Guard 2: Structural Violation (Trend failure)
+structure_guard = (regime_state == LONG_REGIME and close < active_low) or (regime_state == SHORT_REGIME and close > active_high)
+
+// Guard 3: Regime Drift (Internal momentum failure)
+regime_drift_guard = (regime_state == LONG_REGIME and close < sys_ema20 - 0.4 * safe_atr) or (regime_state == SHORT_REGIME and close > sys_ema20 + 0.4 * safe_atr)
+
+// Guard 4: Divergence Exhaustion
+divergence_guard = (regime_state != NEUTRAL and sys_obv_slope20 * math.sign(regime_state) < 0 and sys_z_score * math.sign(regime_state) < 0)
+
+emergency_override_triggered = vol_spike_guard or structure_guard or regime_drift_guard or divergence_guard
+
+// Post-override cooldown: force NEUTRAL for hysteresis_bars after emergency
+var int override_cooldown = 0
+
+// Deferred NEUTRAL transition flag
+var bool pending_neutral = false
+
+//  STATE MACHINE EXECUTION (strict order) 
+
+// STEP 0: Emergency override (highest priority  bypasses everything)
+if emergency_override_triggered and regime_state != NEUTRAL
+    regime_state := NEUTRAL
+    override_cooldown := hysteresis_bars
+    pending_neutral := false
+
+// STEP 1: Cooldown enforcement (keeps regime locked to NEUTRAL after override)
+if override_cooldown > 0
+    override_cooldown -= 1
+    regime_state := NEUTRAL
+
+// STEP 2: Decrement hysteresis countdown
+if hysteresis_countdown > 0
+    hysteresis_countdown -= 1
+
+// STEP 3: Evaluate transitions (only when NOT in cooldown and NOT in hysteresis hold)
+if override_cooldown == 0 and not hysteresis_active
+    // Enter LONG_REGIME (EMA Persistence Restored)
+    if regime_state != LONG_REGIME and ema9_gt_ema20_5bars and obv_slope20_confirms_long
+        regime_state := LONG_REGIME
+        hysteresis_countdown := 0
+        pending_neutral := false
+
+    // Enter SHORT_REGIME
+    else if regime_state != SHORT_REGIME and ema9_lt_ema20_5bars and obv_slope20_confirms_short
+        regime_state := SHORT_REGIME
+        hysteresis_countdown := 0
+        pending_neutral := false
+
+    // Enter NEUTRAL (normal conditions)
+    else if normal_neutral_conditions and (regime_state == LONG_REGIME or regime_state == SHORT_REGIME)
+        regime_state := NEUTRAL
+
+// STEP 4: Deferred transition (capture NEUTRAL signals during hysteresis hold)
+if hysteresis_active and normal_neutral_conditions
+    pending_neutral := true
+
+// STEP 5: Process deferred flag when hysteresis expires
+if not hysteresis_active and pending_neutral
+    regime_still_valid_long  = ema9_gt_ema20_5bars and obv_slope20_confirms_long and close_vs_vwap_confirms_long
+    regime_still_valid_short = ema9_lt_ema20_5bars and obv_slope20_confirms_short and close_vs_vwap_confirms_short
+    if (regime_state == LONG_REGIME and regime_still_valid_long) or (regime_state == SHORT_REGIME and regime_still_valid_short)
+        pending_neutral := false   // trend resumed  clear flag
+    else
+        regime_state := NEUTRAL    // conditions didn't recover  honor deferred transition
+        pending_neutral := false
+
+// Regime age: tracks bars since last regime change (for Mode B trend age filter)
+if regime_state != regime_state[1]
+    regime_age := 0
+else
+    regime_age += 1
+
+regime_age_pre_z = regime_age // Forensic Alias
+
+// 
+// SECTION F: Confluence Scoring (Step 4b)
+// Zone ghosting prevention: FVG/OB use [1] lookback
+// 
+
+confluence_score = 0
+if is_at_monday_range
+    confluence_score += 1
+if is_in_fvg_zone[1]
+    confluence_score += 1
+if is_at_order_block[1]
+    confluence_score += 1
+if (regime_state == LONG_REGIME and obv_slope_confirms_entry_long) or (regime_state == SHORT_REGIME and obv_slope_confirms_entry_short) or (regime_state == NEUTRAL)
+    confluence_score += 1
+
+// 
+// SECTION G: SL/TP Price Calculations (Step 8b)
+// 
+
+
+// Per-bar SL distance (directional)  Pure Volatility (No Caps/Floors)
+sl_dist_long  = i_sl_atr_mult_long * safe_atr
+tp_dist_long  = sl_dist_long * i_mode_b_r_long
+sl_dist_short = i_sl_atr_mult_short * safe_atr
+tp_dist_short = sl_dist_short * i_mode_b_r_short
+
+
+// Note: sl_is_capped logic is computed inside snapshot_long/snapshot_short functions at entry time
+
+// VAR SNAPSHOTS: frozen at entry, never slide with price
+// Set in Section I entry logic when a new position opens
+var float snap_sl_long  = na
+var float snap_sl_short = na
+var float snap_tp_long  = na
+var float snap_tp_short = na
+
+// State tracking (must be declared before used in exit management or signals)
+var float entry_price = na
+var int   entry_bar   = na
+var bool  is_mode_a   = false
+var float final_qty   = 0.0
+// Cooldown trackers REMOVED
+
+// Note: trail_activation and trail_offset are computed per-bar in Section I exit management
+// to ensure they adapt to real-time volatility (not frozen at entry-bar ATR)
+
+// 
+// SECTION H: NUC  Nuclear Unified Confluence (Step 0 calibrated)
+// Max 9: RSI extreme(3) + Z extreme(3) + velocity(2) + OBV(1)
+// Threshold: >= 7 = "Extreme Quality"
+// 
+
+nuc_l = (sys_rsi_14 <= v_rl_ign ? 3 : sys_rsi_14 <= v_rsi_l_mild ? 1 : 0) + (sys_z_score <= v_zl_ign ? 3 : sys_z_score <= v_zl_ign * 0.6 ? 1 : 0) + (sys_impulse >= v_vel_high ? 2 : sys_impulse >= v_vel_med ? 1 : 0) + (sys_obv_roc5 > 0 ? 1 : 0)
+nuc_s = (sys_rsi_14 >= v_rs_ign ? 3 : sys_rsi_14 >= v_rsi_s_mild ? 1 : 0) + (sys_z_score >= v_zs_ign ? 3 : sys_z_score >= v_zs_ign * 0.6 ? 1 : 0) + (sys_impulse <= -v_vel_high ? 2 : sys_impulse <= -v_vel_med ? 1 : 0) + (sys_obv_roc5 < 0 ? 1 : 0)
+
+// Logger Helpers
+is_z_in_zone   = (sys_z_score <= v_zl_ign) or (sys_z_score >= v_zs_ign)
+is_rsi_in_zone = (sys_rsi_14 <= v_rl_ign) or (sys_rsi_14 >= v_rs_ign)
+is_nuc_ok      = (nuc_l >= v_nuc_thresh) or (nuc_s >= v_nuc_thresh_s)
+is_obv_roc_ok  = (sys_obv_roc5 > 0 and nuc_l >= 1) or (sys_obv_roc5 < 0 and nuc_s >= 1)
+
+// VWAP persistence counters (Mode B reclaim confirmation)
+var int bars_above_vwap = 0
+var int bars_below_vwap = 0
+if close > sys_vwap
+    bars_above_vwap += 1
+    bars_below_vwap := 0
+else if close < sys_vwap
+    bars_below_vwap += 1
+    bars_above_vwap := 0
+else
+    bars_above_vwap := 0
+    bars_below_vwap := 0
+
+// 
+// SECTION I: Entry Logic  Mode A (Reversal) + Mode B (Continuation)
+// 
+
+//  VWAP RECLAIM (Mode B pullback detection) 
+// RESTORED: 4-bar pullback requirement
+int vwap_min_bars = 4
+
+vwap_reclaim_bull_2bar = close > sys_vwap and nz(close[1], close) > sys_vwap and nz(close[2], close) < sys_vwap and bars_below_vwap[2] >= vwap_min_bars
+vwap_reclaim_bear_2bar = close < sys_vwap and nz(close[1], close) < sys_vwap and nz(close[2], close) > sys_vwap and bars_above_vwap[2] >= vwap_min_bars
+
+vwap_reclaim_bull = vwap_reclaim_bull_2bar or (close > sys_vwap and nz(close[1], close) < sys_vwap and bars_below_vwap[1] >= vwap_min_bars)
+vwap_reclaim_bear = vwap_reclaim_bear_2bar or (close < sys_vwap and nz(close[1], close) > sys_vwap and bars_above_vwap[1] >= vwap_min_bars)
+
+is_vwap_reclaimed = vwap_reclaim_bull or vwap_reclaim_bear
+pullback_long_logic  = is_vwap_reclaimed or is_in_fvg_zone or is_at_order_block
+pullback_short_logic = is_vwap_reclaimed or is_in_fvg_zone or is_at_order_block
+
+// Condition 4: Filters (RSI/Z-score preventers)
+not_exhausted_long  = sys_rsi_14 <= v_max_rsi_l and sys_z_score <= v_max_z_l
+not_exhausted_short = sys_rsi_14 >= v_max_rsi_s and sys_z_score >= v_max_z_s
+
+// Condition 5: Trend maturity
+trend_mature_long  = regime_age >= v_age_l
+trend_mature_short = regime_age >= v_age_s
+
+// Condition 3: Momentum confirms
+momentum_long  = sys_obv_slope20 > 0
+momentum_short = sys_obv_slope20 < 0
+
+//  TRIGGER CONDITIONS 
+// Condition 1: Sweep + body confirm
+has_body = (high - low) > 0 and math.abs(close - open) >= 0.3 * (high - low)
+touched_below_low  = low < active_low or (i_sweep_tol_atr > 0 and low <= active_low and low >= active_low - i_sweep_tol_atr * safe_atr)
+touched_above_high = high > active_high or (i_sweep_tol_atr > 0 and high >= active_high and high <= active_high + i_sweep_tol_atr * safe_atr)
+sweep_long  = touched_below_low and close > active_low and has_body
+sweep_short = touched_above_high and close < active_high and has_body
+
+// Condition 2: Ignition trigger (Price + OBV only in Permissive Mode)
+price_confirm_long  = close > open or close > low[1]
+price_confirm_short = close < open or close < high[1]
+
+is_ignited_long  = sys_z_score <= v_zl_ign and sys_rsi_14 <= v_rl_ign and sys_obv_roc5 > 0 and price_confirm_long
+is_ignited_short = sys_z_score >= v_zs_ign and sys_rsi_14 >= v_rs_ign and sys_obv_roc5 < 0 and price_confirm_short
+
+// Condition 3: Conviction filter (NUC + confluence)
+has_conviction_long  = nuc_l >= v_nuc_thresh and nuc_s <= 2 and confluence_score >= v_conf_min
+has_conviction_short = nuc_s >= v_nuc_thresh_s and nuc_l <= 2 and confluence_score >= v_conf_min_s
+
+// Global ENTRY GATES (Chop Filter Parity)
+l_gate = not is_choppy and adx_zscore >= v_adx_gate and velocity >= v_vel_gate
+s_gate = not is_choppy and adx_zscore >= v_adx_gate and velocity <= -v_vel_gate
+
+// Mode A final signal
+reversal_long  = v_use_a and sweep_long and is_fvg_bull_lag and is_ignited_long and has_conviction_long and l_gate
+reversal_short = v_use_a and sweep_short and is_fvg_bear_lag and is_ignited_short and has_conviction_short and s_gate
+
+//  MODE B: CONTINUATION ENTRY 
+in_long_regime  = regime_state == LONG_REGIME
+in_short_regime = regime_state == SHORT_REGIME
+
+// Mode B final signal
+continuation_long  = v_use_b and in_long_regime and pullback_long_logic and momentum_long and not_exhausted_long and trend_mature_long and l_gate and confluence_score >= v_conf_min
+continuation_short = v_use_b and in_short_regime and pullback_short_logic and momentum_short and not_exhausted_short and trend_mature_short and s_gate and confluence_score >= v_conf_min_s
+
+// Minimal test: (sweep or pullback) + gate only
+minimal_long_ok  = (sweep_long or (in_long_regime and pullback_long_logic)) and (is_fvg_bull_lag or is_ob_bull_lag or is_monday_range_lag) and l_gate
+minimal_short_ok = (sweep_short or (in_short_regime and pullback_short_logic)) and (is_fvg_bear_lag or is_ob_bear_lag or is_monday_range_lag) and s_gate
+
+
+
+
+f_tr(p) => math.round(p / syminfo.mintick) * syminfo.mintick
+
+snapshot_long(float ep, bool mode_a, float atr_val) =>
+    float d_raw = v_sl_l * atr_val
+    float d = math.max(ep * v_sl_floor, math.min(d_raw, ep * v_sl_cap))
+    bool is_capped = d_raw >= ep * v_sl_cap
+    float r_mult = mode_a ? v_mode_a_r : v_mode_b_r_l
+    float tp_mult = is_capped ? 1.5 : r_mult
+    [f_tr(ep - d), f_tr(ep + (d * tp_mult))]
+
+snapshot_short(float ep, bool mode_a, float atr_val) =>
+    float d_raw = v_sl_s * atr_val
+    float d = math.max(ep * v_sl_floor, math.min(d_raw, ep * v_sl_cap))
+    bool is_capped = d_raw >= ep * v_sl_cap
+    float r_mult = mode_a ? v_mode_a_r : v_mode_b_r_s
+    float tp_mult = is_capped ? 1.5 : r_mult
+    [f_tr(ep + d), f_tr(ep - (d * tp_mult))]
+
+// FROZEN Execution Anchor (Phase 2 Master Lock)
+var float fill_price = na
+bool filled_now = (strategy.position_size != 0 and strategy.position_size[1] == 0)
+if filled_now
+    fill_price := strategy.position_avg_price
+
+liquidation_price_long() => 
+    entry_price * (1.0 - 1.0/i_max_leverage)
+
+liquidation_price_short() => 
+    entry_price * (1.0 + 1.0/i_max_leverage)
+
+barssince_entry = na(entry_bar) ? 999 : (bar_index - entry_bar)
+
+// Directional adverse move (prevents profit-suicide bug)
+adverse_long  = nz(entry_price, close) - close
+adverse_short = close - nz(entry_price, close)
+
+//  ENTRY EXECUTION 
+// Mode A takes precedence. Mode A can UPGRADE an existing Mode B (flag flip only, no re-entry).
+// Mode B only enters when flat.
+
+// Track active entry ID for per-bar exit management
+// Fix 6: Use exact static strings to prevent memory string pool leaks
+var string active_entry_id = na
+
+// PRODUCTION FIX C1: Global trail state (prevents every-bar exit spam)
+var bool trail_placed_long  = false
+var bool trail_placed_short = false
+
+var int   snapshot_conf_at_entry    = na
+var float snap_atr                  = na
+var int   snap_trail_act            = na
+var int   snap_trail_off            = na
+
+//  STEP 5: REFRESH SIGNAL SNAPSHOTS (BEFORE entry, captures pre-entry state) 
+// PRODUCTION FIX C2: Moved BEFORE entry execution so logged Z/RSI/NUC reflect entry conditions
+if reversal_long or continuation_long
+    log_z       := sys_z_score
+    log_rsi     := sys_rsi_14
+    log_vel     := velocity
+    log_atr     := safe_atr
+    log_adx_z   := adx_zscore
+    log_nuc     := nuc_l
+    log_conf    := confluence_score
+    log_regime  := regime_state
+    log_side    := 1
+    log_mode    := reversal_long ? "A" : "B"
+    snapshot_sl_dist_at_entry := strategy.position_size > 0 ? sl_dist_long : sl_dist_short
+
+if reversal_short or continuation_short
+    log_z       := sys_z_score
+    log_rsi     := sys_rsi_14
+    log_vel     := velocity
+    log_atr     := safe_atr
+    log_adx_z   := adx_zscore
+    log_nuc     := nuc_s
+    log_conf    := confluence_score
+    log_regime  := regime_state
+    log_side    := -1
+    log_mode    := reversal_short ? "A" : "B"
+    snapshot_sl_dist_at_entry := sl_dist_short
+
+// LONG entries
+// Signal logic (cooldown removed)
+bool long_signal = ((reversal_long or continuation_long) or (v_min_test and minimal_long_ok))
+bool short_signal = ((reversal_short or continuation_short) or (v_min_test and minimal_short_ok))
+
+// Entry IDs and Comments (already defined in global scope)
+
+f_calc_qty_val(float entry, float risk_pct) =>
+    float risk_notional = strategy.equity * (risk_pct / 100.0)
+    float max_q = nz(strategy.equity * i_max_leverage / entry, (10000.0 * i_max_leverage) / entry)
+    float q = math.min(risk_notional / entry, max_q)
+    math.round(q, 5)
+
+// Forensic export state (must precede f_forensic_* helpers that reference the buffer).
+var array<string> forensic_h_buffer = array.new_string(0)
+var int     forensic_d_stride = 1
+
+// --- Forensic line budget (TradingView Pine Logs: only ~10k historical messages are guaranteed) ---
+// If your account ever exposes a higher cap, bump both helpers together.
+f_forensic_tv_line_budget() =>
+    10000
+
+// Target slightly below hard-cap so deck + CSV export rounding stay safe.
+f_forensic_line_budget_safe() =>
+    9800
+
+// One-time prefix block already logged: SCHEMA, HANDSHAKE, S_GENESIS, EXPORT_PARAMS, H1, H2 (~6 lines + margin).
+f_forensic_prefix_slack() =>
+    24
+
+// Closing deck: checkpoint + START + END + DONE + margin (excludes H/T which we budget explicitly).
+f_forensic_deck_core_slack() =>
+    120
+
+f_forensic_effective_cap() =>
+    f_forensic_tv_line_budget()
+
+// Project final closed-trade count from progress so we don't over-stream D early and chop T/EXPORT_DONE.
+f_forensic_t_reserve_projected() =>
+    int ts = strategy.closedtrades
+    int bi = bar_index
+    int lb = last_bar_index
+    if lb <= 0 or bi < 0
+        ts
+    else
+        float prog = float(bi + 1) / float(lb + 1)
+        int t_proj = prog >= 0.001 ? int(math.ceil(ts / prog)) : ts
+        math.max(ts, t_proj)
+
+// H lines are NOT streamed live (buffered) — reserve space for future H before all trades are closed.
+f_forensic_h_future_slack() =>
+    int t_rsv = f_forensic_t_reserve_projected()
+    10 * math.max(0, t_rsv - strategy.closedtrades)
+
+// Reserve: closing deck + projected T + buffered H + future H slack + planning margin.
+f_forensic_tail_reserve_now() =>
+    int t_rsv = f_forensic_t_reserve_projected()
+    int h_buf = array.size(forensic_h_buffer)
+    // deck_lines: EXPORT_CHECKPOINT + START + END + DONE = 4
+    int deck_lines = 4
+    deck_lines + t_rsv + h_buf + f_forensic_h_future_slack() + f_forensic_prefix_slack() + f_forensic_deck_core_slack()
+
+// Max D rows we may still emit (safety gate on top of stride sampling).
+f_forensic_d_cap_now() =>
+    int budget = f_forensic_line_budget_safe()
+    int tail = f_forensic_tail_reserve_now()
+    int cap = budget - tail
+    math.max(100, cap)
+
+// OHLCV_PASS: we export D only; reserve a small fixed slack for prefix + closing lines.
+f_forensic_d_cap_ohlcv() =>
+    // Empirically safe per-pass D budget (TV may truncate earlier than 9800 depending on environment).
+    // Keep this conservative so OHLCV passes never leave gaps.
+    9400
+
+// Buffer H rows so live logging only carries D + prefix; deck flushes H then T (complete tail).
+f_forensic_queue_h(string line) =>
+    if exp_export_logs and exp_export_ledger
+        array.push(forensic_h_buffer, line)
+
+var int event_count = 0
+var int last_sub_id = 0
+
+// New entry from flat (or flip from short); minimal test: treat sweep as Mode A
+if long_signal and strategy.position_size == 0
+    is_mode_a := reversal_long or (v_min_test and sweep_long)
+    [sl, tp] = snapshot_long(close, is_mode_a, safe_atr)
+    final_qty := f_calc_qty_val(close, v_risk_l)
+    event_count += 1
+    last_sub_id := event_count
+    string e_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",H_SUBMIT,LONG," + str.tostring(close, "#.########") + "," + str.tostring(final_qty) + "," + ZENITH_CONTRACT_V1
+    if exp_export_logs and exp_export_ledger
+        f_forensic_queue_h(e_log)
+    
+    strategy.entry(ID_L, strategy.long, qty=final_qty, comment=ENTRY_COMM_L, alert_message=ENTRY_COMM_L)
+    snap_sl_long := sl
+    snap_tp_long := tp
+    strategy.exit("Exit_Long", from_entry=ID_L, stop=sl, limit=tp)
+    entry_price := close * (1.0 + i_slip_base) 
+    entry_bar   := bar_index
+    active_entry_id := ID_L
+    snap_atr := safe_atr
+    snap_trail_act := math.round((sl_dist_long * v_trail_act_l) / syminfo.mintick)
+    trail_mult = adx_zscore < 0 ? v_trail_lv : (adx_zscore < 1.5 ? v_trail_mv : v_trail_hv)
+    snap_trail_off := math.round((trail_mult * snap_atr) / syminfo.mintick)
+else if short_signal and strategy.position_size == 0
+    is_mode_a := reversal_short or (v_min_test and sweep_short)
+    [sl, tp] = snapshot_short(close, is_mode_a, safe_atr)
+    final_qty := f_calc_qty_val(close, v_risk_s)
+    event_count += 1
+    last_sub_id := event_count
+    string e_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",H_SUBMIT,SHORT," + str.tostring(close, "#.########") + "," + str.tostring(final_qty) + "," + ZENITH_CONTRACT_V1
+    if exp_export_logs and exp_export_ledger
+        f_forensic_queue_h(e_log)
+    
+    strategy.entry(ID_S, strategy.short, qty=final_qty, comment=ENTRY_COMM_S, alert_message=ENTRY_COMM_S)
+    snap_sl_short := sl
+    snap_tp_short := tp
+    strategy.exit("Exit_Short", from_entry=ID_S, stop=sl, limit=tp)
+    entry_price := close * (1.0 - i_slip_base) 
+    entry_bar   := bar_index
+    active_entry_id := ID_S
+    snap_atr := safe_atr
+    snap_trail_act := math.round((sl_dist_short * v_trail_act_s) / syminfo.mintick)
+    trail_mult = adx_zscore < 0 ? v_trail_lv : (adx_zscore < 1.5 ? v_trail_mv : v_trail_hv)
+    snap_trail_off := math.round((trail_mult * snap_atr) / syminfo.mintick)
+
+if filled_now
+    if strategy.position_size > 0
+        [sl, tp] = snapshot_long(fill_price, is_mode_a, safe_atr)
+        snap_sl_long := sl
+        snap_tp_long := tp
+        string f_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",H_FILL,LONG," + str.tostring(fill_price, "#.########") + "," + str.tostring(math.abs(strategy.position_size)) + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(f_log)
+    else if strategy.position_size < 0
+        [sl, tp] = snapshot_short(fill_price, is_mode_a, safe_atr)
+        snap_sl_short := sl
+        snap_tp_short := tp
+        string f_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",H_FILL,SHORT," + str.tostring(fill_price, "#.########") + "," + str.tostring(math.abs(strategy.position_size)) + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(f_log)
+else if reversal_long and strategy.position_size > 0 and not is_mode_a
+    // Mode A UPGRADE: recompute SL/TP + Refresh ID (fix stale ID after B->A flip)
+    is_mode_a := true
+    active_entry_id := strategy.position_size > 0 ? ID_L : ID_S
+    trail_placed_long := false, trail_placed_short := false // PI-1: Symmetric Reset
+    [sl_fix, tp_fix] = snapshot_long(fill_price, true, safe_atr)
+    snap_sl_long := sl_fix
+    snap_tp_long := tp_fix
+
+if strategy.position_size == 0
+    active_entry_id := na
+    is_mode_a := false
+
+//  PER-BAR EXIT MANAGEMENT 
+
+// Runs EVERY bar while in a position. This ensures:
+// 1. Trail activation and offset are frozen at entry (Diamond Parity)
+// 2. TP/SL are anchored to actual fill price
+// 3. Single exit ID per direction forces Pine to REPLACE (not stack) exit orders
+
+// rt_trail_activation and rt_trail_offset are now handled directionally inside position blocks
+
+
+// Safety Exit Gates (Rollback)
+allow_exit_long  = true
+allow_exit_short = true
+
+// LONG position exit management (uses FROZEN snapshots for SL/TP + Trail)
+if strategy.position_size > 0 and not na(active_entry_id)
+    liq_p = liquidation_price_long()
+    if low <= liq_p
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,LONG,LIQ," + str.tostring(low, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="LIQ")
+    
+    rsi_exit_long = sys_rsi_14 > i_rsi_ex_l and (adx_zscore < 0 or adx_zscore < nz(adx_zscore[1]))
+    if rsi_exit_long
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,LONG,RSI," + str.tostring(close, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="RSI")
+
+    // Exhaustion Exit: momentum reversed, price below mean, trend broken
+    if i_use_exh_exit and allow_exit_long and velocity < i_exh_vel_l and sys_z_score < i_exh_z_l and (i_exh_regime ? regime_state != LONG_REGIME : true)
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,LONG,EXH," + str.tostring(close, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="EXH")
+
+    // --- State tracking to prevent every-bar replacement ---
+    if strategy.position_size[1] <= 0 // New trade or flat
+        trail_placed_long := false
+        
+    if allow_exit_long
+        if not trail_placed_long
+            strategy.exit("Exit_Long", from_entry=active_entry_id, stop=snap_sl_long, limit=snap_tp_long, trail_points=int(snap_trail_act), trail_offset=int(snap_trail_off))
+            trail_placed_long := true
+    else
+        if strategy.position_size[1] <= 0 // Initial placement on entry bar
+            strategy.exit("Exit_Long", from_entry=active_entry_id, stop=snap_sl_long, limit=snap_tp_long)
+
+// SHORT position exit management (uses FROZEN snapshots for SL/TP + Trail)
+if strategy.position_size < 0 and not na(active_entry_id)
+    liq_p = liquidation_price_short()
+    if high >= liq_p
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,SHORT,LIQ," + str.tostring(high, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="LIQ")
+
+    rsi_exit_short = sys_rsi_14 < i_rsi_ex_s and (adx_zscore > 0 or adx_zscore > nz(adx_zscore[1]))
+    if rsi_exit_short
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,SHORT,RSI," + str.tostring(close, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="RSI")
+
+    // Exhaustion Exit: momentum reversed, price above mean, downtrend broken
+    if i_use_exh_exit and allow_exit_short and velocity > i_exh_vel_s and sys_z_score > i_exh_z_s and (i_exh_regime ? regime_state != SHORT_REGIME : true)
+        event_count += 1
+        last_sub_id := event_count
+        string sub_log = "H," + str.tostring(bar_index) + "," + f_epoch_iso(time) + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",EXIT_SUBMIT,SHORT,EXH," + str.tostring(close, "#.########") + "," + ZENITH_CONTRACT_V1
+        if exp_export_logs and exp_export_ledger
+            f_forensic_queue_h(sub_log)
+        strategy.close(active_entry_id, comment="EXH")
+
+    // --- State tracking to prevent every-bar replacement ---
+    if strategy.position_size[1] >= 0 // New trade or flat
+        trail_placed_short := false
+        
+    if allow_exit_short
+        if not trail_placed_short
+            strategy.exit("Exit_Short", from_entry=active_entry_id, stop=snap_sl_short, limit=snap_tp_short, trail_points=int(snap_trail_act), trail_offset=int(snap_trail_off))
+            trail_placed_short := true
+    else
+        if strategy.position_size[1] >= 0 // Initial placement on entry bar
+            strategy.exit("Exit_Short", from_entry=active_entry_id, stop=snap_sl_short, limit=snap_tp_short)
+
+// 
+// SECTION K: Forensic Logging & Data Export (State Declarations)
+// 
+f_b(b) => b ? 1 : 0
+// T-row Reason field must never contain commas/newlines/double-quotes — breaks CSV.split / csv.reader downstream.
+f_csv_safe(string s) =>
+    // exit_comment(i) is series string — nz() does not accept that; use na check (CE10123).
+    string t = na(s) ? "" : s
+    t := str.replace_all(t, ",", "_")
+    t := str.replace_all(t, "\n", " ")
+    t := str.replace_all(t, "\r", " ")
+    t := str.replace_all(t, "\"", "'")
+    int mx = 240
+    str.length(t) > mx ? str.substring(t, 0, mx) : t
+// Export window: if both filters off, allow full series; else require time and/or bar range.
+in_window() =>
+    if not i_lg_time and not i_lg_idx
+        true
+    else
+        okT = not i_lg_time or (time >= i_t_start and time <= i_t_end)
+        okB = not i_lg_idx or (bar_index >= i_b_start and bar_index <= i_b_end)
+        okT and okB
+
+var int    p_log_count    = 0
+var string saved_prow  = na
+var string sig_meta    = na
+var string sig_g_row   = na
+var string sig_schema  = "SCHEMA,H-v10.27,T-v10.27,D-v10.27-H2-DATA12,DBGS-v10.27"
+var string sig_h1      = "Prefix,BarIndex,Timestamp,EventID,SchemaID,Event,Side,Price,Qty,ContractID"
+var string sig_h2      = "Prefix,BarIndex,Timestamp,SchemaID,PnL_R,ContractID"
+var string sig_h3      = "Prefix,BarIndex,Timestamp,SchemaID,Pos,Price,EntryBar"
+
+// One-shot: SCHEMA / HANDSHAKE / S_GENESIS / params must precede D-rows (not halfway through the chart).
+var bool forensic_handshake_done = false
+var int  d_rows_streamed = 0
+var int  d_stream_remaining = 0
+// Closing deck must run exactly once after the *last bar confirms* (islast alone can misfire on open last bar in some modes).
+var bool forensic_deck_emitted = false
+
+// DBGS rows: enable i_debug_mode and wire log.info(SyncRow) here if you need per-bar sync in the log (costs budget).
+var int gate_state_int = 0
+
+// --- Forensic handshake: first confirmed bar (must not depend on window filters) ---
+var int snap_regime  = 0
+var int snap_reg_age = 0
+var int snap_ema_a   = 0
+var int snap_ema_b   = 0
+var int snap_vw_a    = 0
+var int snap_vw_b    = 0
+var int snap_hyst    = 0
+var bool snap_neut   = false
+
+if exp_export_logs and barstate.isconfirmed and not forensic_handshake_done
+    snap_regime  := regime_state
+    snap_reg_age := regime_age
+    snap_ema_a   := ema9_above_ema20_count
+    snap_ema_b   := ema9_below_ema20_count
+    snap_vw_a    := bars_above_vwap
+    snap_vw_b    := bars_below_vwap
+    snap_hyst    := hysteresis_countdown
+    snap_neut    := pending_neutral
+
+    string tf = str.tostring(timeframe.multiplier) + timeframe.period
+    sig_meta := str.format("HANDSHAKE_META,{0},Diamond21Build,Trading_v21,{1},{2},Europe/Sofia,UTC_DAY,{3,number,#.########},pct,{4,number,#.########},{5,number,#.########}", 
+         SCHEMA_ID, syminfo.ticker, tf, syminfo.mintick, STRAT_COMMISSION, strategy.initial_capital)
+    
+    string ts_gen = f_epoch_iso(time)
+    sig_g_row := "S_GENESIS," + str.tostring(bar_index) + "," + ts_gen + "," + SCHEMA_ID + "," + str.format("{0,number,#},{1,number,#},{2,number,#},{3,number,#},{4,number,#},{5,number,#},{6,number,#},{7,number,#},0|0,0.0|0.0|0",
+         snap_regime, snap_reg_age, snap_ema_a, snap_ema_b, snap_vw_a, snap_vw_b, snap_hyst, snap_neut ? 1 : 0)
+
+    string p1 = str.format("riskl={0,number},risks={1,number},sll={2,number,#.######},sls={3,number,#.######},slfloorpct={4,number,#.######},slcappct={5,number,#.######},modear={6,number,#.######},modebrlong={7,number,#.######},modebrshort={8,number,#.######}",
+         v_risk_l, v_risk_s, v_sl_l, v_sl_s, v_sl_floor, v_sl_cap, v_mode_a_r, v_mode_b_r_l, v_mode_b_r_s)
+    string p2 = str.format("trailactivationlong={0,number,#.######},trailactivationshort={1,number,#.######},traillv={2,number,#.######},trailmv={3,number,#.######},trailhv={4,number,#.######},nucl={5,number,#.######},nucs={6,number,#.######},confl={7,number},confs={8,number}",
+         v_trail_act_l, v_trail_act_s, v_trail_lv, v_trail_mv, v_trail_hv, v_nuc_thresh, v_nuc_thresh_s, v_conf_min, v_conf_min_s)
+    string p3 = str.format("usea={0},useb={1},adxl={2,number,#.######},adxs={3,number,#.######},velhigh={4,number,#.######},velmed={5,number,#.######},chopmult={6,number,#.######},adxdec={7,number,#.######},adxgate={8,number,#.######}",
+         v_use_a, v_use_b, v_adx_z_l, v_adx_z_s, v_vel_high, v_vel_med, v_chop_threshold, v_adx_dec, v_adx_gate)
+    string p4 = str.format("velgate={0,number,#.######},rsiexl={1,number,#.######},rsiexs={2,number,#.######},maxrsil={3,number},maxrsis={4,number},maxzl={5,number,#.######},maxzs={6,number,#.######},zl={7,number,#.######},zs={8,number,#.######}",
+         v_vel_gate, v_rsi_ex_l, v_rsi_ex_s, v_max_rsi_l, v_max_rsi_s, v_max_z_l, v_max_z_s, v_zl_ign, v_zs_ign)
+    string p5 = str.format("rl={0,number,#.######},rs={1,number,#.######},rsilmild={2,number,#.######},rsismild={3,number,#.######},cdl={4,number},cds={5,number},agel={6,number},ages={7,number},sweeptolatr={8,number,#.######}",
+         v_rl_ign, v_rs_ign, v_rsi_l_mild, v_rsi_s_mild, v_cd_l, v_cd_s, v_age_l, v_age_s, v_sweep_tol)
+    string p6 = str.format("strictregimesync={0},usechopfilter={1},emapersistbars={2,number},useexhaustionexit={3},exhvell={4,number,#.######},exhzl={5,number,#.######},exhvels={6,number,#.######},exhzs={7,number,#.######}",
+         i_strict_regime_sync, v_use_chop, i_ema_persist_bars, v_use_exh, i_exh_vel_l, i_exh_z_l, i_exh_vel_s, i_exh_z_s)
+
+    saved_prow := "EXPORT_PARAMS_START," + p1 + "," + p2 + "," + p3 + "," + p4 + "," + p5 + "," + p6
+
+    log.info(sig_schema)
+    log.info(sig_meta)
+    log.info(sig_g_row)
+    log.info(saved_prow)
+    log.info(sig_h1)
+    log.info(sig_h2)
+    // Plan D sampling stride (TRADES legacy) or pass splitting (OHLCV_PASS) or ledger-only (LEDGER_PASS: no D).
+    int TB = last_bar_index + 1
+    if _want_ohlcv or _want_ledpass
+        forensic_d_stride := 1
+    else if _want_trades_legacy
+        // PERFECT PARITY: Force d_stride=1 for exact bar alignment
+        forensic_d_stride := 1
+        // Original dynamic calculation (commented out for perfect parity):
+        // int t_budget = math.max(strategy.closedtrades, int(math.ceil(TB / 200.0)))
+        // int h_plan = 12 * t_budget
+        // int deck_plan = 4 + t_budget
+        // int reserved = h_plan + deck_plan + f_forensic_deck_core_slack() + 100
+        // int d_allow = f_forensic_line_budget_safe() - 6 - reserved
+        // d_allow := math.max(200, d_allow)
+        // forensic_d_stride := int(math.ceil(TB / d_allow))
+        forensic_d_stride := math.max(1, forensic_d_stride)
+    forensic_handshake_done := true
+
+// Channel 1: 26 new data_window plots (always active)
+// Channel 2: log.info() trade events (guarded by i_export_logs)
+// 
+
+// --- Total GState Replacement (Rule 2: Clinical Hierarchy) ---
+// P1: Regime (10s) | P2: Safety (20s) | P3: Signal (30s)
+int gstate_p1 = (regime_state == 0) ? 13 : (is_choppy) ? 14 : 0
+int gstate_p2 = (math.abs(sys_impulse) >= v_vel_high) ? 21 : (not is_at_monday_range) ? 22 : 0
+int gstate_p3 = (not (sweep_long or sweep_short)) ? 31 : (sys_rsi_14 > v_max_rsi_l or sys_rsi_14 < v_max_rsi_s) ? 33 : (confluence_score < v_conf_min) ? 36 : 0
+
+// Precedence Logic: P1 > P2 > P3
+gate_state_int := (reversal_long or reversal_short or continuation_long or continuation_short) ? 0 : 
+                  (gstate_p1 != 0) ? gstate_p1 : (gstate_p2 != 0) ? gstate_p2 : (gstate_p3 != 0) ? gstate_p3 : 0
+
+//  ZERO-TRADE DIAGNOSTIC TABLE (v6.7-Lock Clinical Mapping) 
+if i_show_diagnostic and barstate.islast
+    if na(diag_table)
+        diag_table := table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 20), border_width=1)
+    string blocker = gate_state_int == 13 ? "NEUTRAL (Regime)" :
+                     gate_state_int == 14 ? "CHOPPY (ADX/VSR)" :
+                     gate_state_int == 21 ? "HI-VEL (Safety)" :
+                     gate_state_int == 22 ? "MONDAY RANGE (Safety)" :
+                     gate_state_int == 31 ? "NO SWEEP (Signal)" :
+                     gate_state_int == 33 ? "RSI ERROR (Signal)" :
+                     gate_state_int == 36 ? "CONFLUENCE (Signal)" : "READY / POSITION"
+    
+    table.cell(diag_table, 0, 0, "Zero-Trade Diagnostic", text_color=color.yellow, text_size=size.small)
+    table.cell(diag_table, 0, 1, "Regime", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 1, regime_state == 1 ? "LONG" : regime_state == -1 ? "SHORT" : "NEUTRAL", text_color=color.white, text_size=size.tiny)
+    table.cell(diag_table, 0, 2, "Choppy / VSR", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 2, is_choppy ? "YES" : "NO", text_color=is_choppy ? color.red : color.lime, text_size=size.tiny)
+    table.cell(diag_table, 0, 3, "L-Gate / S-Gate", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 3, (l_gate ? "L" : "") + (s_gate ? "S" : ""), text_color=color.lime, text_size=size.tiny)
+    table.cell(diag_table, 0, 4, "NUC L / Thresh", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 4, str.tostring(nuc_l, "#.#") + " / " + str.tostring(v_nuc_thresh, "#.#"), text_color=nuc_l >= v_nuc_thresh ? color.lime : color.orange, text_size=size.tiny)
+    table.cell(diag_table, 0, 5, "OBV ROC5", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 5, str.tostring(sys_obv_roc5, "#.##"), text_color=sys_obv_roc5 > 0 ? color.lime : color.red, text_size=size.tiny)
+    table.cell(diag_table, 0, 6, "GState Code", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 6, str.tostring(gate_state_int), text_color=gate_state_int == 0 ? color.lime : color.orange, text_size=size.tiny)
+    table.cell(diag_table, 0, 7, "Blocker (v6.7)", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 7, blocker, text_color=color.orange, text_size=size.tiny)
+    table.cell(diag_table, 0, 8, "Mode", text_color=color.gray, text_size=size.tiny)
+    table.cell(diag_table, 1, 8, "DIRECT INPUT", text_color=color.lime, text_size=size.tiny)
+
+// No dedicated status tracking
+
+
+
+
+//  STEP 1: DETECT POSITION CLOSE 
+position_closed = (strategy.position_size[1] != 0) and
+                  (strategy.position_size == 0 or
+                   math.sign(strategy.position_size) != math.sign(strategy.position_size[1]))
+
+// Reset trail placement on position close
+if position_closed
+    trail_placed_long  := false
+    trail_placed_short := false
+
+//  STEP 2: LOGGING TRACKERS 
+// --- D-Row Column Calculations ---
+cached_bars_held = barssince_entry // Uses definition from line 770
+
+//  STEP 3: FIRE EXIT LOG 
+if position_closed and exp_export_logs
+    bool was_long = strategy.position_size[1] > 0
+    float exit_px = strategy.closedtrades > 0 ? strategy.closedtrades.exit_price(strategy.closedtrades - 1) : close
+    
+    // PnL calculation
+    sl_dist = was_long ? (nz(entry_price) - nz(snap_sl_long)) : (nz(snap_sl_short) - nz(entry_price))
+    float pnl_r = sl_dist > 0 ? (was_long ? (exit_px - nz(entry_price)) : (nz(entry_price) - exit_px)) / sl_dist : 0
+    
+    string ts_iso_exit = f_epoch_iso(time)
+    string exit_log = "H," + str.tostring(bar_index) + "," + ts_iso_exit + "," + str.tostring(last_sub_id) + "," + SCHEMA_ID + ",H_FILL,EXIT," + (was_long ? "LONG" : "SHORT") + "," + str.tostring(exit_px, "#.########") + "," + str.tostring(pnl_r, "#.##") + "," + ZENITH_CONTRACT_V1
+    if exp_export_ledger
+        f_forensic_queue_h(exit_log)
+
+// Entry fill is logged once in `filled_now` (H_FILL,LONG|SHORT) to avoid duplicate EventID rows.
+
+//  SECTION K: VISUAL OUTPUT 
+plot(sys_ema9,  "EMA 9",  color=color.new(color.yellow, 0), linewidth=1)
+plot(sys_ema20, "EMA 20", color=color.new(color.orange, 0), linewidth=1)
+plot(active_high, "Active High", color=color.new(color.lime, 0),    linewidth=2, style=plot.style_stepline)
+plot(active_low,  "Active Low",  color=color.new(color.fuchsia, 0), linewidth=2, style=plot.style_stepline)
+
+// State machine plots
+plot(regime_state, "Regime State", display=display.data_window)
+plot(confluence_score, "Confluence", display=display.data_window)
+plot(nuc_l, "NUC Long", display=display.data_window)
+plot(nuc_s, "NUC Short", display=display.data_window)
+plot(barssince_entry, "Bars Since Entry", display=display.data_window)
+
+// Entry markers
+plotshape(reversal_long, "Mode A Long", style=shape.triangleup, location=location.belowbar, color=color.lime, text="A")
+plotshape(reversal_short, "Mode A Short", style=shape.triangledown, location=location.abovebar, color=color.red, text="A")
+plotshape(continuation_long, "Mode B Long", style=shape.circle, location=location.belowbar, color=color.aqua, text="B")
+plotshape(continuation_short, "Mode B Short", style=shape.circle, location=location.abovebar, color=color.orange, text="B")
+
+//  STEP 7: BULK DUMP FORENSICS (Rule: v10.27 Logging Engine) 
+
+// --- TRACK A STEP 1: FORENSIC WINDOW & EDGE LOGIC (in_window defined above) ---
+
+entry_event = strategy.position_size != 0 and strategy.position_size[1] == 0
+exit_event  = strategy.position_size == 0 and strategy.position_size[1] != 0
+
+is_decision_edge() =>
+    // Pine `nz()` does not accept bool series. Convert to int and handle `na()` explicitly.
+    int ign_l_now  = f_b(is_ignited_long)
+    int ign_s_now  = f_b(is_ignited_short)
+    // Some Pine builds type `na()` as float-only; use a bar_index guard instead.
+    int ign_l_prev = bar_index > 0 ? f_b(is_ignited_long[1])  : ign_l_now
+    int ign_s_prev = bar_index > 0 ? f_b(is_ignited_short[1]) : ign_s_now
+
+    bool edge =
+         (ign_l_now != ign_l_prev) or
+         (ign_s_now != ign_s_prev) or
+         (regime_state != nz(regime_state[1], regime_state)) or
+         (strategy.position_size != strategy.position_size[1]) or
+         entry_event or exit_event
+    edge
+
+// Compute on every bar (avoids CW10002 inconsistent history warning).
+bool decision_edge = is_decision_edge()
+
+if i_debug_mode and i_mode_select == "Forensic" and decision_edge and in_window()
+    log.info(str.format("FORENSIC | {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8}",
+         bar_index, regime_state, strategy.position_size, entry_event, exit_event, is_ignited_long, is_ignited_short, sys_z_score, sys_rsi_14))
+
+//  PER-BAR D-ROW EMISSION (58 CSV fields — matches Python DATA12_V1 / Zenith loader)
+if barstate.isfirst
+    d_rows_streamed := 0
+    forensic_deck_emitted := false
+    array.clear(forensic_h_buffer)
+
+bool d_in_scope = _want_ohlcv ? true : in_window()
+if exp_export_logs and barstate.isconfirmed and exp_export_data and forensic_handshake_done and d_in_scope
+    string ts_d = f_epoch_iso(time)
+    int ent_age = bar_index - nz(entry_bar, bar_index)
+    float cur_sl_dist = strategy.position_size > 0 ? sl_dist_long : sl_dist_short
+    int fvg_op = f_b(is_in_fvg_zone[1])
+    int ob_op  = f_b(is_at_order_block[1])
+    
+    bool d_stride_ok = forensic_d_stride <= 1 or bar_index % forensic_d_stride == 0 or bar_index == last_bar_index
+    bool d_trade_ok = entry_event or exit_event or position_closed
+    bool d_should_emit = _want_ohlcv ? d_stride_ok : (d_stride_ok or d_trade_ok)
+
+    // OHLCV_PASS: export a contiguous full-D slice per pass (multiple runs).
+    int o_pass_start = 0
+    int o_pass_end = last_bar_index
+    int o_passes = 1
+    if _want_ohlcv
+        int ohlcv_allow = f_forensic_d_cap_ohlcv()
+        o_passes := int(math.ceil(float(last_bar_index + 1) / float(ohlcv_allow)))
+        int pass_idx = math.min(i_ohlcv_pass - 1, o_passes - 1)
+        o_pass_start := pass_idx * ohlcv_allow
+        o_pass_end := math.min(last_bar_index, o_pass_start + ohlcv_allow - 1)
+        // Restrict emission to this pass-range only.
+        d_should_emit := d_should_emit and bar_index >= o_pass_start and bar_index <= o_pass_end
+    
+    int cap_now = _want_ohlcv ? f_forensic_d_cap_ohlcv() : f_forensic_d_cap_now()
+    d_stream_remaining := math.max(0, cap_now - d_rows_streamed)
+    if d_stream_remaining > 0 and d_should_emit
+        string d_str = str.format("D,{0},{1},{2},{3,number,#.########},{4,number,#.########},{5,number,#.########},{6,number,#.########},{7,number,#.########},{8,number,#.########},{9,number,#.########},{10,number,#},{11,number,#.########},{12,number,#.########},{13,number,#.########},{14,number,#.########},{15,number,#.########},{16,number,#.########},{17,number,#.########},{18,number,#.########},{19,number,#.########},{20,number,#.########},{21,number,#},{22,number,#},{23,number,#},{24,number,#.########},{25,number,#.########},{26,number,#.########},{27,number,#.########},{28,number,#.########},{29,number,#},{30,number,#},{31,number,#},{32,number,#},{33,number,#},{34,number,#},{35,number,#.########},{36,number,#.########},{37,number,#.########},{38,number,#},{39,number,#},{40,number,#.########},{41,number,#},{42,number,#},{43,number,#},{44,number,#},{45,number,#},{46,number,#},{47,number,#},{48,number,#.########},{49,number,#},{50,number,#},{51,number,#.########},{52,number,#.########},{53,number,#.########},{54,number,#.########},{55,number,#},{56}",
+             str.tostring(bar_index), ts_d, SCHEMA_DATA12, open, high, low, close, volume, 
+             nz(sys_ema9), nz(sys_ema20), nz(regime_age), nz(sys_z_score), nz(sys_rsi_14), nz(velocity), nz(adx_zscore), nz(sys_atr14), nz(sys_atr20), nz(sys_obv), nz(sys_obv_sma20), nz(sys_obv_roc5), nz(sys_obv_slope20), 
+             nz(regime_state), nz(ema9_above_ema20_count), nz(ema9_below_ema20_count), nz(nuc_l), nz(nuc_s), nz(confluence_score), nz(sys_vwap), nz(vsr_val),
+             fvg_op, ob_op, f_b(is_at_monday_range), nz(bars_above_vwap), nz(bars_below_vwap),
+             nz(gate_state_int), nz(active_high), nz(active_low), nz(strategy.position_size), f_b(reversal_long or reversal_short), f_b(continuation_long or continuation_short),
+             nz(cur_sl_dist), f_b(sweep_long or sweep_short), f_b(is_vwap_reclaimed), f_b(price_confirm_long or price_confirm_short), 
+             nz(hysteresis_countdown), f_b(pending_neutral), 0, 0,
+             nz(entry_price), nz(ent_age), nz(snap_trail_act), nz(snap_trail_off), nz(strategy.position_size), nz(sl_dist_long), nz(tp_dist_long), nz(entry_bar, -1), SCHEMA_DATA12)
+        log.info(d_str)
+        d_rows_streamed += 1
+    d_stream_remaining := math.max(0, f_forensic_d_cap_now() - d_rows_streamed)
+
+// Final Bulk Dump (Zero-Drift Canonical Export)
+// Use last confirmed historical bar so the deck emits even when the chart's last bar is realtime/unconfirmed.
+bool forensic_close_now = exp_export_logs and not forensic_deck_emitted and (barstate.islastconfirmedhistory or (barstate.islast and barstate.isconfirmed))
+if forensic_close_now
+    forensic_deck_emitted := true
+    int d_cap_eff = _want_ohlcv ? f_forensic_d_cap_ohlcv() : f_forensic_d_cap_now()
+    d_stream_remaining := math.max(0, d_cap_eff - d_rows_streamed)
+    // --- Phase 8 Industrial Parity Lock (Unbreakable Final Export) ---
+    int tcount = strategy.closedtrades
+    // Full T-ledger: closing-deck lines are reserved per bar via f_forensic_d_cap_now() (trades in tail).
+    int t_lim = tcount
+    int t_skip = 0
+    // FIRST: one-line checkpoint (parser ignores; humans + grep friendly).
+    int nh_buf = array.size(forensic_h_buffer)
+    int tb_tot = last_bar_index + 1
+    // Multipart OHLCV pass span (Fix 7); full-chart span for TRADES / LEDGER_PASS.
+    int deck_bi_start = 0
+    int deck_bi_end = bar_index
+    if _want_ohlcv
+        int ohlcv_allow_cp = f_forensic_d_cap_ohlcv()
+        int o_passes_cp = int(math.ceil(float(last_bar_index + 1) / float(ohlcv_allow_cp)))
+        int pass_idx_cp = math.min(i_ohlcv_pass - 1, o_passes_cp - 1)
+        deck_bi_start := pass_idx_cp * ohlcv_allow_cp
+        deck_bi_end := math.min(last_bar_index, deck_bi_start + ohlcv_allow_cp - 1)
+    string layout = _want_ohlcv ? "ohlcv_pass_v1" : (_want_ledpass ? "ledger_pass_v1" : "v2_hdeck")
+    string checkpoint = "EXPORT_CHECKPOINT," + f_epoch_iso(time) + ",bar_index=" + str.tostring(bar_index) + ",bars_total=" + str.tostring(tb_tot) + ",d_stride=" + str.tostring(forensic_d_stride) + ",h_queued=" + str.tostring(nh_buf) + ",log_layout=" + layout + ",budget=" + str.tostring(f_forensic_effective_cap()) + ",d_cap=" + str.tostring(d_cap_eff) + ",d_rows_streamed=" + str.tostring(d_rows_streamed) + ",d_stream_remaining=" + str.tostring(d_stream_remaining) + ",closed_trades=" + str.tostring(tcount) + ",t_logged=" + str.tostring(t_lim) + ",t_omitted=" + str.tostring(t_skip) + ",handshake=" + str.tostring(forensic_handshake_done ? 1 : 0) + ",bi_start=" + str.tostring(deck_bi_start) + ",bi_end=" + str.tostring(deck_bi_end) + "," + SCHEMA_ID
+    log.info(checkpoint)
+    log.info("START_OF_FORENSIC_DECK")
+    
+    // 1. ALWAYS replay minimal handshake + headers at deck start so a tail-only export is self-describing.
+    if not na(sig_meta)
+        log.info(sig_schema)
+        log.info(sig_meta)
+        log.info(sig_g_row)
+        log.info(saved_prow)
+        log.info(sig_h1)
+        log.info(sig_h2)
+
+    // 2. Buffered H stream (entry/exit events) in chronological order.
+    if not _want_ohlcv
+        if nh_buf > 0
+            for i = 0 to nh_buf - 1
+                log.info(array.get(forensic_h_buffer, i))
+    
+    // 3. Sanitized Ledger Export — T-rows need ledger and are skipped in OHLCV_PASS.
+    if (not _want_ohlcv) and exp_export_ledger and tcount > 0
+        for i = 0 to tcount - 1
+            float qty = math.abs(strategy.closedtrades.size(i))
+            string t_reason = f_csv_safe(strategy.closedtrades.exit_comment(i))
+            // TradeID: stable ledger key (entry BI, exit BI, side) — not closed-trade index (Fix 5).
+            string trade_id = str.tostring(strategy.closedtrades.entry_bar_index(i)) + "-" + str.tostring(strategy.closedtrades.exit_bar_index(i)) + "-" + (strategy.closedtrades.size(i) > 0 ? "L" : "S")
+            string trow = "T," + str.tostring(strategy.closedtrades.exit_bar_index(i)) + "," + f_epoch_iso(strategy.closedtrades.exit_time(i)) + "," + SCHEMA_DATA12 + "," + trade_id + "," + (strategy.closedtrades.size(i) > 0 ? "1" : "-1") + "," + str.tostring(strategy.closedtrades.entry_bar_index(i)) + "," + str.tostring(strategy.closedtrades.exit_bar_index(i)) + "," + f_epoch_iso(strategy.closedtrades.entry_time(i)) + "," + f_epoch_iso(strategy.closedtrades.exit_time(i)) + "," + str.tostring(strategy.closedtrades.entry_price(i), "#.########") + "," + str.tostring(strategy.closedtrades.exit_price(i), "#.########") + "," + str.tostring(qty, "#.########") + "," + str.tostring(strategy.closedtrades.commission(i), "#.########") + ",0.0," + str.tostring(strategy.closedtrades.profit(i), "#.########") + ",NaN," + t_reason + "," + ZENITH_CONTRACT_V1
+            log.info(trow)
+
+    log.info("END_OF_FORENSIC_DECK")
+    string export_done = "EXPORT_DONE," + f_epoch_iso(time) + ",bar_index=" + str.tostring(bar_index) + ",bars_total=" + str.tostring(tb_tot) + ",d_stride=" + str.tostring(forensic_d_stride) + ",log_layout=" + layout + ",budget=" + str.tostring(f_forensic_effective_cap()) + ",d_cap=" + str.tostring(d_cap_eff) + ",d_rows_streamed=" + str.tostring(d_rows_streamed) + ",d_stream_remaining=" + str.tostring(d_stream_remaining) + ",closed_trades=" + str.tostring(tcount) + ",t_logged=" + str.tostring(t_lim) + ",final=1,bi_start=" + str.tostring(deck_bi_start) + ",bi_end=" + str.tostring(deck_bi_end) + "," + SCHEMA_ID
+    log.info(export_done)
+
+
