@@ -895,6 +895,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Do not write Pine file")
     parser.add_argument("--no-verify", action="store_true", help="Skip post-patch verification (default is verify)")
     parser.add_argument("--verify-only", action="store_true", help="Only verify current Pine vs CSV (no write)")
+    parser.add_argument("--verbose", action="store_true", help="Print full per-param table (CSV value | expected | actual | status) during verify")
     parser.add_argument(
         "--loose-floats",
         action="store_true",
@@ -944,7 +945,8 @@ def main() -> None:
 
     row = load_combo_row(csv_path, args.combo)
     print(f"[+] Loaded {args.combo} from {os.path.basename(csv_path)}")
-    print(f"    Eq={row.get('Eq')} PF={row.get('PF')} WR={row.get('WR')} Trades={row.get('Trades')} Score={row.get('Score')}")
+    eq_val = row.get('Equity') or row.get('Eq') or row.get('equity')
+    print(f"    Eq={eq_val} PF={row.get('PF')} WR={row.get('WR')} Trades={row.get('Trades')} Score={row.get('Score')}")
 
     with open(args.pine, "r", encoding="utf-8") as f:
         original = f.read()
@@ -953,20 +955,48 @@ def main() -> None:
     _chk_lbl = not args.skip_parity_label
 
     if args.verify_only:
-        errs = verify_all_gs66_params_transferred(
-            original, row, strict=_strict, check_parity_label=_chk_lbl
-        )
-        if errs:
-            print(f"[FAIL] {len(errs)} mismatch(es):")
-            for e in errs[:40]:
-                print("   ", e)
-            if len(errs) > 40:
-                print(f"    ... +{len(errs) - 40} more")
-            sys.exit(1)
-        print(
-            f"[OK] Full GS66 transfer verified: {MAGIC_PARAM_COUNT} params + "
-            f"parity label={'on' if _chk_lbl else 'skipped'} (strict_floats={_strict})."
-        )
+        if args.verbose:
+            parsed = parse_pine_inputs(original)
+            print(f"\n{'PARAM':<22} {'CSV VALUE':<20} {'EXPECTED':<20} {'PINE ACTUAL':<20} STATUS")
+            print("-" * 100)
+            mismatches = 0
+            for var, (csv_col, kind, scale) in MAGIC_MAP:
+                csv_raw = _mega_csv_cell(row, csv_col)
+                expected = expected_pine_first_arg(row, csv_col, kind, scale)
+                exp_lit  = format_pine_literal(expected, kind)
+                pine_entry = parsed.get(var)
+                if pine_entry is None:
+                    pine_lit = "MISSING"
+                    status = "FAIL"
+                    mismatches += 1
+                else:
+                    pine_lit = format_pine_literal(pine_entry[1], kind)
+                    match = (pine_lit == exp_lit)
+                    status = "OK" if match else "FAIL"
+                    if not match:
+                        mismatches += 1
+                flag = " <-- MISMATCH" if status == "FAIL" else ""
+                print(f"{csv_col:<22} {csv_raw:<20} {exp_lit:<20} {pine_lit:<20} {status}{flag}")
+            print("-" * 100)
+            if mismatches:
+                print(f"\n[FAIL] {mismatches} mismatch(es) found.")
+                sys.exit(1)
+            print(f"\n[OK] All {MAGIC_PARAM_COUNT} params match exactly.")
+        else:
+            errs = verify_all_gs66_params_transferred(
+                original, row, strict=_strict, check_parity_label=_chk_lbl
+            )
+            if errs:
+                print(f"[FAIL] {len(errs)} mismatch(es):")
+                for e in errs[:40]:
+                    print("   ", e)
+                if len(errs) > 40:
+                    print(f"    ... +{len(errs) - 40} more")
+                sys.exit(1)
+            print(
+                f"[OK] Full GS66 transfer verified: {MAGIC_PARAM_COUNT} params + "
+                f"parity label={'on' if _chk_lbl else 'skipped'} (strict_floats={_strict})."
+            )
         return
 
     new_content, n = patch_pine_content(original, row)

@@ -5,7 +5,7 @@ strategy("Diamond Sentinel V10", overlay=true, commission_type=strategy.commissi
 // ZENITH MASTER CONTRACT V1
 string ZENITH_CONTRACT_V1 = "ZENITH_CONTRACT_V1"
 
-// [SOURCE: ID_00779 | WR: 60.9% | PF: 2.051171 | Trades: 23 | Eq: 10019.44]
+// [SOURCE: ID_00003 | WR: 65.0% | PF: 2.677389 | Trades: 20 | Eq: 0]
 // 
 // SECTION: PRIMARY CONTROLS (Your Wish )
 // 
@@ -15,8 +15,8 @@ float i_risk_long   = f_risk_long / 100.0
 float i_risk_short  = f_risk_short / 100.0
 
 // Exit Controls
-i_rsi_ex_l = input.float(83.95614, "Exit RSI (Long)", group="Exits")
-i_rsi_ex_s = input.float(16.165475, "Exit RSI (Short)", group="Exits")
+i_rsi_ex_l = input.float(86.267399, "Exit RSI (Long)", group="Exits")
+i_rsi_ex_s = input.float(34.162787, "Exit RSI (Short)", group="Exits")
 i_use_exh_exit = input.bool(true, "Use Exhaustion Exit", group="Exits")
 
 // Diagnostic & Forensic (Usually Hidden)
@@ -56,58 +56,58 @@ i_b_end       = input.int(99999, "Forensic End Bar Index", group="Advanced/Foren
 // 
 // SECTION: ADVANCED TUNING (Overridden when PRO is ON)
 // 
-i_z_long_zone = input.float(-1.144855, "Z-Score Long", group="Advanced/Indicator Override")
-i_z_short_zone = input.float(0.822208, "Z-Score Short", group="Advanced/Indicator Override")
-i_rsi_long_mild = input.float(39, "RSI Long Mild", group="Advanced/Indicator Override")
-i_rsi_short_mild = input.float(59, "RSI Short Mild", group="Advanced/Indicator Override")
-i_velocity_high = input.float(0.108762, "Impulse Threshold", group="Advanced/Indicator Override")
-i_nuc_threshold = input.float(3.359073, "NUC Threshold L", group="Advanced/Indicator Override")
-i_nuc_threshold_s = input.float(2.260184, "NUC Threshold S", group="Advanced/Indicator Override")
+i_z_long_zone = input.float(-1.675844, "Z-Score Long", group="Advanced/Indicator Override")
+i_z_short_zone = input.float(0.609605, "Z-Score Short", group="Advanced/Indicator Override")
+i_rsi_long_mild = input.float(44, "RSI Long Mild", group="Advanced/Indicator Override")
+i_rsi_short_mild = input.float(57, "RSI Short Mild", group="Advanced/Indicator Override")
+i_velocity_high = input.float(0.060454, "Impulse Threshold", group="Advanced/Indicator Override")
+i_nuc_threshold = input.float(3.879396, "NUC Threshold L", group="Advanced/Indicator Override")
+i_nuc_threshold_s = input.float(1.800476, "NUC Threshold S", group="Advanced/Indicator Override")
 i_confluence_min = input.int(1, "Conf Min", group="Advanced/Indicator Override")
-i_mode_a_r = input.float(3.404102, "R-Mult Mode A", group="Advanced/Indicator Override")
-i_sl_atr_mult_long = input.float(2.08342, "SL ATR Mult (Long)", group="Advanced/Indicator Override")
-i_sl_atr_mult_short = input.float(1.997127, "SL ATR Mult (Short)", group="Advanced/Indicator Override")
-f_sl_floor_pct = input.float(1.2795, "SL Floor %", group="Advanced/Indicator Override")
-f_sl_cap_pct = input.float(3.6442, "SL Cap %", group="Advanced/Indicator Override")
+i_mode_a_r = input.float(3.835668, "R-Mult Mode A", group="Advanced/Indicator Override")
+i_sl_atr_mult_long = input.float(2.464701, "SL ATR Mult (Long)", group="Advanced/Indicator Override")
+i_sl_atr_mult_short = input.float(2.612871, "SL ATR Mult (Short)", group="Advanced/Indicator Override")
+f_sl_floor_pct = input.float(1.0461, "SL Floor %", group="Advanced/Indicator Override")
+f_sl_cap_pct = input.float(2.6451, "SL Cap %", group="Advanced/Indicator Override")
 i_sl_floor_pct      = f_sl_floor_pct / 100.0
 i_sl_cap_pct        = f_sl_cap_pct / 100.0
 
 // Trailing Stop Hidden Defaults
-i_trail_activation_long = input.float(1.409305, "Trail Act (L)", group="Advanced/Trail")
-i_trail_activation_short = input.float(1.010188, "Trail Act (S)", group="Advanced/Trail")
-i_trail_lv = input.float(3.56153, "Trail LV", group="Advanced/Trail")
-i_trail_mv = input.float(1.501015, "Trail MV", group="Advanced/Trail")
-i_trail_hv = input.float(-1.323956, "Trail HV", group="Advanced/Trail")
+i_trail_activation_long = input.float(1.582647, "Trail Act (L)", group="Advanced/Trail")
+i_trail_activation_short = input.float(1.516468, "Trail Act (S)", group="Advanced/Trail")
+i_trail_lv = input.float(2.043984, "Trail LV", group="Advanced/Trail")
+i_trail_mv = input.float(1.579461, "Trail MV", group="Advanced/Trail")
+i_trail_hv = input.float(-0.00304, "Trail HV", group="Advanced/Trail")
 
 // Filters
 i_use_reversal = input.bool(true, "Mode A: Reversal", group="Filters")
 i_use_continuation = input.bool(true, "Mode B: Continuation", group="Filters")
 bool  i_use_chop_filter   = input.bool(true, "Chop Filter", group="Filters")
 bool  i_use_daily_anchors = input.bool(true, "Use Daily structural anchors", group="Filters")
-i_chop_threshold = input.float(0.171327, "Chop SD", group="Filters")
+i_chop_threshold = input.float(0.21301, "Chop SD", group="Filters")
 float i_max_leverage      = input.float(20.0, "Max Leverage", group="Filters")
 
 // Re-map internal names not in inputs but used in code
 bool i_minimal_test = false
-int i_ema_persist_bars = input.int(4, "EMA Persist Bars", group="Advanced")
+int i_ema_persist_bars = input.int(11, "EMA Persist Bars", group="Advanced")
 float i_ad_decel = -8.7
-float i_adx_decel_thresh = input.float(-4.696349, "ADX Decel Thresh", group="Advanced")
+float i_adx_decel_thresh = input.float(-3.320571, "ADX Decel Thresh", group="Advanced")
 float i_emergency_atr_mult = 2.5
 int i_vwap_min_bars_base = 4
-float i_max_z_l = input.float(2.196951, "Max Z Long", group="Advanced")
-float i_max_z_s = input.float(-1.275321, "Max Z Short", group="Advanced")
-int i_min_trend_age_long = input.int(6, "Min Trend Age Long", group="Advanced")
-int i_min_trend_age_short = input.int(3, "Min Trend Age Short", group="Advanced")
-float i_min_adx_z_long = input.float(0.046767, "Min ADX Z Long", group="Advanced")
-float i_min_adx_z_short = input.float(-0.838835, "Min ADX Z Short", group="Advanced")
-float i_min_adx_gate = input.float(-13.337987, "Min ADX Gate", group="Advanced")
-float i_min_vel_gate = input.float(0.200599, "Min Vel Gate", group="Advanced")
+float i_max_z_l = input.float(2.262511, "Max Z Long", group="Advanced")
+float i_max_z_s = input.float(-1.622435, "Max Z Short", group="Advanced")
+int i_min_trend_age_long = input.int(10, "Min Trend Age Long", group="Advanced")
+int i_min_trend_age_short = input.int(6, "Min Trend Age Short", group="Advanced")
+float i_min_adx_z_long = input.float(0.2283, "Min ADX Z Long", group="Advanced")
+float i_min_adx_z_short = input.float(-1.246948, "Min ADX Z Short", group="Advanced")
+float i_min_adx_gate = input.float(-12.015552, "Min ADX Gate", group="Advanced")
+float i_min_vel_gate = input.float(0.190142, "Min Vel Gate", group="Advanced")
 i_use_fixed_qty = false
 i_fixed_qty_val = 1.0
-float i_mode_b_r_long = input.float(3.157737, "Mode B R Long", group="Advanced")
-float i_mode_b_r_short = input.float(3.290059, "Mode B R Short", group="Advanced")
-float i_rsi_long_extreme = input.float(28.438873, "RSI Long Extreme", group="Advanced")
-float i_rsi_short_extreme = input.float(62.360032, "RSI Short Extreme", group="Advanced")
+float i_mode_b_r_long = input.float(5.986425, "Mode B R Long", group="Advanced")
+float i_mode_b_r_short = input.float(4.3519, "Mode B R Short", group="Advanced")
+float i_rsi_long_extreme = input.float(37.149183, "RSI Long Extreme", group="Advanced")
+float i_rsi_short_extreme = input.float(75.574438, "RSI Short Extreme", group="Advanced")
 float i_slip_base = 0.0003
 float i_max_slip_v_m = 2.0
 float i_exh_vel_l = input.float(0, "Exh Vel L", group="Advanced")
@@ -115,16 +115,16 @@ float i_exh_z_l = input.float(0, "Exh Z L", group="Advanced")
 float i_exh_vel_s = input.float(0, "Exh Vel S", group="Advanced")
 float i_exh_z_s = input.float(0, "Exh Z S", group="Advanced")
 bool i_exh_regime = input.bool(false, "Exh Regime", group="Advanced")
-float i_sweep_tol_atr = input.float(0.209062, "Sweep Tol ATR", group="Advanced")
-int i_max_rsi_long = input.int(71, "Max RSI Long", group="Advanced")
-int i_max_rsi_short = input.int(6, "Max RSI Short", group="Advanced")
-float i_velocity_med = input.float(0.07234, "Velocity Med", group="Advanced")
+float i_sweep_tol_atr = input.float(0.109438, "Sweep Tol ATR", group="Advanced")
+int i_max_rsi_long = input.int(77, "Max RSI Long", group="Advanced")
+int i_max_rsi_short = input.int(8, "Max RSI Short", group="Advanced")
+float i_velocity_med = input.float(0.094988, "Velocity Med", group="Advanced")
 int i_confluence_min_s = input.int(1, "Conf Min S", group="Advanced")
 float i_min_adx_z_long_override = -2.3
 float i_min_adx_z_short_override = 0.03
 bool i_strict_regime_sync = input.bool(true, "Strict Regime Sync", group="Advanced")
-int i_cd_l = input.int(34, "CD L", group="Advanced")
-int i_cd_s = input.int(28, "CD S", group="Advanced")
+int i_cd_l = input.int(16, "CD L", group="Advanced")
+int i_cd_s = input.int(37, "CD S", group="Advanced")
 
 // Common Identifiers
 var string ID_L = "Long"
@@ -190,7 +190,7 @@ bool v_min_test = i_minimal_test
 // --- VISUAL CONFIRMATION ---
 var table parity_lbl = table.new(position.top_center, 1, 1)
 if barstate.islast
-    table.cell(parity_lbl, 0, 0, "PARITY ACTIVE ID_00779", bgcolor=color.new(color.lime, 20), text_color=color.black, text_size=size.small)
+    table.cell(parity_lbl, 0, 0, "PARITY ACTIVE ID_00003", bgcolor=color.new(color.lime, 20), text_color=color.black, text_size=size.small)
 
 
 // 

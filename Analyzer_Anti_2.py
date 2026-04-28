@@ -17,8 +17,36 @@ OPT_PATH = os.path.join(os.path.dirname(__file__), "Optimizer_Anti_2.py")
 _BACKUP_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKUP_DIR not in sys.path:
     sys.path.insert(0, _BACKUP_DIR)
-import zenith_schema
+import zenithnew3 as zenith_schema
+zenith_csv = zenith_schema
 import re
+
+# zenithnew3 — single source of truth for proof/runtime contract (v2.4)
+from zenithnew3 import (
+    CertificationProof,
+    InputFingerprint,
+    MismatchDetail,
+    ReconciliationStats,
+    SignalSourceSummary,
+    ToleranceProfile,
+    TradeRecord,
+    VersionStamp,
+    build_default_tolerance,
+    validate_proof_dict,
+    assert_valid_proof_dict,
+    hash_dict,
+    hash_file,
+    CERT_KIND_STRICT_PREDICTIVE,
+    resolve_certification_kind,
+    schema_oracle_from_signal_source,
+    # Bundle A — certification seal + canonical trade normalization
+    RuntimeContract,
+    assert_cert_run_clean,
+    py_trade_to_record,
+    tv_trade_to_record,
+    normalize_py_trades,
+    normalize_tv_trades,
+)
 
 # Optional helper: read full GS66 params from patched Pine.
 try:
@@ -47,49 +75,205 @@ CANONICAL_FORENSIC_LOG_CHAIN = ",".join(
 CANONICAL_MARKET_OHLCV_CSV = os.path.join(_OLD_DIR, "market_21055.csv")
 CANONICAL_LISTOFTRADES_CSV = os.path.join(_OLD_DIR, "listoftrades.csv")
 
-def load_params_from_mega_results(csv_path, combo_id):
-    """Load simulate()-shaped params from mega_results (GS66 or legacy Pascal); BOM-safe."""
-    import importlib
+def append_test_result_csv(out_csv, combo_id, stats, params, schema_id="GS66v1",
+                           contract_token="Diamond21Build", segtags="", segtb=""):
+    """Write one test result row with full statistical block to mega-style CSV."""
+    row = zenith_csv.build_test_result_row(
+        combo_id=combo_id,
+        stats=stats,
+        params=params,
+        schema_id=schema_id,
+        contract_token=contract_token,
+        segtags=segtags,
+        segtb=segtb,
+    )
+    exists = os.path.exists(out_csv) and os.path.getsize(out_csv) > 0
+    with open(out_csv, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(zenith_csv.test_result_header()))
+        if not exists:
+            writer.writeheader()
+        writer.writerow(row)
 
+def load_params_from_mega_results(csv_path, combo_id):
+    """Load simulate()-shaped params from mega_results via zenithnew normalization."""
     if not os.path.exists(csv_path):
         return {}
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames:
-            return {}
-        hdr = zenith_schema.sanitize_csv_fieldnames(reader.fieldnames)
+    with open(csv_path, "r", encoding="utf-8") as f:
+        reader = csv.reader(f)
         try:
-            kind = zenith_schema.classify_mega_header(hdr)
-        except zenith_schema.UnrecognizedHeaderError:
+            raw_header = next(reader)
+        except StopIteration:
+            return {}
+        hdr = zenith_csv.sanitize_csv_fieldnames(raw_header)
+        try:
+            zenith_csv.classify_mega_header(hdr)
+        except zenith_csv.UnrecognizedHeaderError:
             return {}
         cid = (combo_id or "").strip()
-        for row in reader:
-            row_n = zenith_schema.normalize_dict_row_keys(row)
-            if (row_n.get("ComboID") or "").strip() != cid:
+        for row_list in reader:
+            row_n = zenith_csv.normalize_full_results_row(row_list, hdr)
+            if (str(row_n.get("ComboID", "")).strip()) != cid:
                 continue
-            if kind == "gs66":
-                rlist = [row_n.get(h, "") for h in hdr]
-                parsed = zenith_schema.parse_param_cells_from_full_row(rlist, header=hdr)
-            else:
-                mn = importlib.import_module("magic_numbers_Cursor")
-                parsed = mn.mega_results_row_to_canonical_params(
-                    {k: str(v if v is not None else "") for k, v in row_n.items()}
-                )
+            parsed = zenith_csv.extract_params_from_normalized_row(row_n)
             merged = {
                 k: optimizer.FORENSIC_PARAMS[k]
-                for k in zenith_schema.CSV_PARAM_KEYS
+                for k in zenith_csv.CSV_PARAM_KEYS
                 if k in optimizer.FORENSIC_PARAMS
             }
-            for k in zenith_schema.CSV_PARAM_KEYS:
+            for k in zenith_csv.CSV_PARAM_KEYS:
                 if k not in merged:
                     merged[k] = (
-                        False
-                        if k in zenith_schema.PARAM_IS_BOOL
-                        else (0 if k in zenith_schema.PARAM_IS_INT else 0.0)
+                        False if k in zenith_csv.PARAM_IS_BOOL
+                        else (0 if k in zenith_csv.PARAM_IS_INT else 0.0)
                     )
             merged.update(parsed)
             return merged
     return {}
+
+def _roundtrip_test(out_csv: str, combo_id: str = "RT_TEST") -> int:
+    """End-to-end CSV roundtrip: optimizer params -> CSV -> analyzer loader."""
+    combo_id = str(combo_id or "RT_TEST").strip() or "RT_TEST"
+
+    # 1) Build a synthetic stats block (minimal but valid)
+    stats = {
+        "Eq": 1000.0,
+        "PF": 1.0,
+        "WR": 50.0,
+        "Trades": 10,
+        "TrL": 5,
+        "TrS": 5,
+        "Sharpe": "",
+        "DD": "",
+        "Exp": 0.0,
+        "Score": "",
+        "Dur": "",
+        "TWR": "",
+        "TExp": "",
+        "TPF": 1.0,
+    }
+
+    # 2) Take canonical params from optimizer.FORENSIC_PARAMS
+    base_params = getattr(optimizer, "FORENSIC_PARAMS", {}) or {}
+    golden = {k: base_params.get(k) for k in zenith_csv.CSV_PARAM_KEYS}
+
+    # 3) Write one-row mega-style CSV
+    row = zenith_csv.build_test_result_row(
+        combo_id=combo_id,
+        stats=stats,
+        params=golden,
+        schema_id=zenith_csv.DEFAULT_SCHEMA_ID,
+        contract_token=zenith_csv.DEFAULT_CONTRACT_TOKEN,
+        segtags="roundtrip",
+        segtb="0.0",
+    )
+    header = list(zenith_csv.test_result_header())
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        w.writerow(row)
+
+    # 4) Read back via analyzer loader
+    loaded = load_params_from_mega_results(out_csv, combo_id)
+    if not loaded:
+        print(f"[ROUNDTRIP] FAIL: loader returned empty dict for combo {combo_id}")
+        return 1
+
+    # 5) Compare numeric/boolean equality on CSV_PARAM_KEYS
+    diffs = []
+    for k in zenith_csv.CSV_PARAM_KEYS:
+        expected = golden.get(k)
+        actual = loaded.get(k)
+        if isinstance(expected, bool) or isinstance(actual, bool):
+            if bool(expected) != bool(actual):
+                diffs.append((k, expected, actual))
+        else:
+            try:
+                e = float(expected)
+                a = float(actual)
+            except Exception:
+                if expected != actual:
+                    diffs.append((k, expected, actual))
+            else:
+                if abs(e - a) > 1e-12:
+                    diffs.append((k, expected, actual))
+
+    if diffs:
+        print(f"[ROUNDTRIP] FAIL: {len(diffs)} param mismatches:")
+        for k, e, a in diffs[:20]:
+            print(f"  {k}: expected={e!r} got={a!r}")
+        if len(diffs) > 20:
+            print(f"  ... ({len(diffs) - 20} more)")
+        return 1
+
+    print(f"[ROUNDTRIP] OK: {len(zenith_csv.CSV_PARAM_KEYS)} params round-tripped cleanly.")
+    return 0
+
+# =============================================================================
+# ZENITH SCHEMA INTEGRATION PATCH (v2.4)
+# Schema adapters, proof builder, and trade record conversion.
+# Analyzer is the certification authority — proofs are built here after reconcile().
+# =============================================================================
+
+ANALYZER_VERSION: str = getattr(optimizer, "ANALYZER_VERSION", "1.0")
+
+
+# [DELETED] _py_trade_to_record — Deleted: superseded by zenith_schema.py_trade_to_record (Bundle A canonical normalization)
+
+# [DELETED] _tv_trade_to_record — Deleted: superseded by zenith_schema.tv_trade_to_record (Bundle A canonical normalization)
+
+def _scorecard_to_stats_and_mismatches(
+    scorecard: list,
+    tv_count: int,
+    py_count: int,
+    ghost_count: int,
+    matched_count: int = 0,  # BUG 13 FIX: accept exact count from reconcile() return value
+) -> tuple:
+    """Convert legacy scorecard rows into (ReconciliationStats, List[MismatchDetail]).
+
+    Uses exact counts passed in (from reconcile() return values) rather than
+    inferring from scorecard text — more reliable.
+    matched_count should come directly from reconcile() return, not re-counted here.
+    """
+    price_mismatches = time_mismatches = pnl_mismatches = 0
+    ghost_tv = 0
+    mismatches: List[MismatchDetail] = []
+
+    for row in (scorecard or []):
+        status = str(row.get("status") or row.get("enhanced_status") or "").upper()
+
+        if "MATCH" in status and "MISMATCH" not in status and "FAIL" not in status and "MISSING" not in status:
+            continue  # Match rows counted by caller via matched_count parameter
+
+        if "EXTRA_TV" in status or "EXTRA-TV" in status:
+            ghost_tv += 1
+
+        if "E_P" in status or "X_P" in status or "PRICE" in status:
+            price_mismatches += 1
+        if "E_BAR" in status or "X_BAR" in status or "TIME" in status:
+            time_mismatches += 1
+        if "PROFIT" in status or "PNL" in status:
+            pnl_mismatches += 1
+
+        mismatches.append(MismatchDetail.from_scorecard_row(row))
+
+    stats = ReconciliationStats.from_legacy_counts(
+        python_count=py_count,
+        tv_count=tv_count,
+        matches=matched_count,   # Use caller-supplied exact count
+        ghost_python=ghost_count,
+        ghost_tv=ghost_tv,
+        price_mismatches=price_mismatches,
+        time_mismatches=time_mismatches,
+        pnl_mismatches=pnl_mismatches,
+        perfect_match=(tv_count > 0 and matched_count == tv_count and ghost_count == 0 and ghost_tv == 0),
+    )
+    return stats, mismatches
+
+
+# [DELETED] _trade_to_schema_record — Deleted: superseded by zenithnew3 canonical helpers (py_trade_to_record, tv_trade_to_record)
+# [DELETED] _reconcile_stats_to_schema — Deleted: zero callers; ReconciliationStats built via from_legacy_counts()
+# [DELETED] _normalize_first_mismatch — Deleted: zero callers; first_bad built via MismatchDetail.from_scorecard_row()
+# [DELETED] build_certification_proof — superseded by CertificationProof.from_reconciliation() (Bundle A)
 
 class ZenithAnalyzer:
     def __init__(self, tv_csv, market_csv=None):
@@ -888,21 +1072,30 @@ class ZenithAnalyzer:
                 for r in rows:
                     w.writerow({k: r.get(k) for k in cols})
 
-    def run_simulation(self, mode="parity", combo_id=None):
+    def run_simulation(self, mode="parity", combo_id=None, *, contract=None):
         # ==================================================================
-        # PHASE 6.1 â€” Mode routing guard (SIGNAL_PARITY_PLAN.md v3, Phase 6)
+        # PHASE 6.1 — Mode routing guard (SIGNAL_PARITY_PLAN.md v3, Phase 6)
+        # Phase 3 RuntimeContract migration: accepts optional explicit contract.
+        # When contract is provided (strict_predictive_cert path), it is the
+        # single source of truth — env/globals are derived from it below.
+        # When contract=None (all other modes), behavior is unchanged.
         # ==================================================================
-        _ALLOWED_MODES = {"parity", "autonomous", "compare", "bar_scan", "perf_debug"}
+        # NOTE: "bar_scan" is remapped to "parity" by the caller (main) before run_simulation()
+        # is invoked, so it never reaches the simulation-dispatch branches as a live mode.
+        # It is kept in _ALLOWED_MODES only to allow the env-write branch (autonomous/bar_scan)
+        # and the post-simulation D-snapshot scan (args.mode == "bar_scan" block in main).
+        _ALLOWED_MODES = {"parity", "autonomous", "compare", "bar_scan", "perf_debug", "strict_predictive_cert"}
         if mode not in _ALLOWED_MODES:
             raise ValueError(f"Unknown Analyzer mode {mode!r}. Allowed: {sorted(_ALLOWED_MODES)}")
         if mode == "parity":
-            os.environ.setdefault("MEGA_SIGNAL_SOURCE", "tv_drow")
+            os.environ.setdefault("MEGASIGNALSOURCE",   "tvdrow")
+            os.environ.setdefault("MEGA_SIGNAL_SOURCE", "tvdrow")
             _cur_src = optimizer.get_signal_source_mode()
             # compare mode is a diagnostic overlay: TV values still drive decisions, both stored for diff.
             # py_recalc in parity mode would use Python-only signals â€” that is a certification violation.
             if _cur_src == optimizer.SIGNAL_SOURCE_PY_RECALC:
                 raise ValueError(
-                    f"parity mode forbids MEGA_SIGNAL_SOURCE=py_recalc "
+                    f"parity mode forbids MEGA_SIGNAL_SOURCE=pyrecalc "
                     f"(TV signals would not be used â€” certification integrity violated)"
                 )
             if not optimizer.REQUIRED_TV_SIGNAL_FIELDS:
@@ -910,10 +1103,27 @@ class ZenithAnalyzer:
                     "parity mode: REQUIRED_TV_SIGNAL_FIELDS is empty â€” Phase 3 audit not complete"
                 )
         elif mode in ("autonomous", "bar_scan"):
-            os.environ.setdefault("MEGA_SIGNAL_SOURCE", "py_recalc")
+            os.environ.setdefault("MEGASIGNALSOURCE",   "pyrecalc")
+            os.environ.setdefault("MEGA_SIGNAL_SOURCE", "pyrecalc")
             _cur_src = optimizer.get_signal_source_mode()
         elif mode == "compare":
             os.environ.setdefault("MEGA_SIGNAL_SOURCE", "compare")
+            _cur_src = optimizer.get_signal_source_mode()
+        elif mode == "strict_predictive_cert":
+            # Phase 3 RuntimeContract migration — if contract was passed explicitly,
+            # derive env/globals from it. Otherwise fall back to whatever is already set.
+            if contract is not None:
+                os.environ["MEGASIGNALSOURCE"]     = str(contract.signal_source)
+                os.environ["MEGA_SIGNAL_SOURCE"]   = str(contract.signal_source)
+                os.environ["MEGAPREDICTIVECERT"]   = "1" if contract.predictive_certification else "0"
+                os.environ["MEGA_PREDICTIVE_CERT"] = "1" if contract.predictive_certification else "0"
+                optimizer.PREDICTIVE_CERTIFICATION = bool(contract.predictive_certification)
+            else:
+                # Legacy: env already set by caller (cert branch in main)
+                os.environ.setdefault("MEGASIGNALSOURCE",   "pyrecalc")
+                os.environ.setdefault("MEGA_SIGNAL_SOURCE", "pyrecalc")
+                optimizer.PREDICTIVE_CERTIFICATION = True
+            optimizer.PARITY_MODE = False
             _cur_src = optimizer.get_signal_source_mode()
         else:
             _cur_src = optimizer.get_signal_source_mode()  # perf_debug: read without forcing
@@ -1030,9 +1240,10 @@ class ZenithAnalyzer:
             signal_params=p,
         )
         self.bars_by_bi = {int(b.get("bar_index", b.get("bi", -1))): b for b in self.bars}
-        res = optimizer.simulate(
-            self.bars,
-            p,
+        # Phase 3: dispatch through simulate_with_contract for strict_predictive_cert
+        # so the explicit contract is threaded end-to-end. All other modes continue
+        # to use optimizer.simulate() directly — no behavior change for them.
+        _simulate_kwargs = dict(
             return_trades=True,
             effective_start_bi=effective_start_bi,
             diagnose_bi=getattr(self, 'trace_bi', None),
@@ -1045,7 +1256,20 @@ class ZenithAnalyzer:
             t_ledger=t_ledger,
             bars_mode="full",
         )
-        return res # (equity, wr, pnl_net, pnl_pct, ..., trades)
+        if mode == "strict_predictive_cert" and contract is not None:
+            # Phase 3 final wiring: explicit contract passed end-to-end.
+            # simulate_with_contract calls assert_cert_run_clean on the exact
+            # contract object, then derives env/globals from it before simulation.
+            res = optimizer.simulate_with_contract(
+                self.bars, p,
+                contract=contract,
+                **_simulate_kwargs,
+            )
+        else:
+            # All non-cert modes (parity, autonomous, compare, bar_scan, perf_debug)
+            # and cert mode without explicit contract (legacy env-backed path).
+            res = optimizer.simulate(self.bars, p, **_simulate_kwargs)
+        return res  # (equity, wr, pnl_net, pnl_pct, ..., trades)
 
     def reconcile(self, py_trades, mode_name):
         matches = 0
@@ -2000,9 +2224,13 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["parity", "autonomous", "bar_scan", "perf_debug"],
+        choices=["parity", "autonomous", "bar_scan", "perf_debug", "strict_predictive_cert"],
         default="parity",
-        help="Synchronization mode",
+        help=(
+            "Synchronization mode. "
+            "strict_predictive_cert: forces pyrecalc signal source + PREDICTIVE_CERTIFICATION=True, "
+            "uses analyzer reconciliation (not positional zip) for cert matching, and writes a proof JSON on PASS."
+        ),
     )
     # Perf / harness debug (wraps perf_harness/trade_equality_harness.py)
     parser.add_argument("--data", default=None, help="OHLCV CSV chain (comma-separated) for perf_debug harness runs")
@@ -2054,7 +2282,16 @@ def main():
     parser.add_argument("--sweep-report", metavar="CSV", help="Analyze a mega_results_*_all.csv sweep file and print diagnostics + fine-tuning conclusions")
     parser.add_argument("--golden-suite", choices=["dynamic_atr", "frozen_atr"], metavar="CONFIG", help="Run golden suite unit tests (dynamic_atr=primary, frozen_atr=debug)")
     parser.add_argument("--standalone-test", action="store_true", help="Run a strictly autonomous parity certification (ID_02451 style) for the given --combo.")
+    parser.add_argument(
+        "--roundtrip-test",
+        metavar="CSV",
+        help="Run optimizer->CSV->analyzer roundtrip test and write test file to this path",
+    )
     args = parser.parse_args()
+
+    if args.roundtrip_test:
+        rc = _roundtrip_test(args.roundtrip_test)
+        raise SystemExit(rc)
 
     if args.sweep_report:
         _sweep_report(args.sweep_report)
@@ -2092,7 +2329,37 @@ def main():
         
         # Extract 13-item tuple
         equity, wr, pnl_net, pnl_pct, tc, pf_v, ex_v, pf_total, _, _, tc_l, tc_s, trades = res
-        
+
+        # Build mega-style stats dict for test export
+        stats = {
+            "Eq": equity,
+            "PF": pf_v,
+            "WR": wr,
+            "Trades": tc,
+            "TrL": tc_l,
+            "TrS": tc_s,
+            "Sharpe": "",
+            "DD": "",
+            "Exp": ex_v,
+            "Score": "",
+            "Dur": "",
+            "TWR": "",
+            "TExp": "",
+            "TPF": pf_total,
+        }
+
+        # Write mega-style test result row
+        append_test_result_csv(
+            out_csv="test_results.csv",
+            combo_id=args.combo or "",
+            stats=stats,
+            params=analyzer.csv_params if hasattr(analyzer, "csv_params") else {},
+            schema_id=getattr(analyzer, "schema_id", "GS66v1"),
+            contract_token="Diamond21Build",
+            segtags="test",
+            segtb="0.0",
+        )
+
         print(f"\n=== RESULTS (Autonomous) ===")
         print(f"Trade Count: {tc} (L:{tc_l}, S:{tc_s})")
         print(f"Win Rate: {wr:.2f}%")
@@ -2248,6 +2515,223 @@ def main():
     
     # BAR_SCAN runs a normal independent simulation, then does a bar-by-bar D-snapshot scan.
     run_mode = "parity" if args.mode == "bar_scan" else args.mode
+
+    # ==========================================================================
+    # PHASE 6 / 6A / 6B (v2.4) — strict_predictive_cert mode
+    # ==========================================================================
+    if args.mode == "strict_predictive_cert":
+        # Phase 6.1 — Timezone contract preflight (fail-closed)
+        tz_expected = "Europe/Sofia"
+        tz_optimizer = str(getattr(optimizer, "TIMEZONE", "") or "")
+        if tz_optimizer != tz_expected:
+            print(f"[CERT FAIL] optimizer.TIMEZONE={tz_optimizer!r} expected {tz_expected!r} for strict_predictive_cert")
+            sys.exit(1)
+
+        # Phase 2 RuntimeContract migration — construct contract once, use it as
+        # the single authority throughout this entire cert run.
+        _cert_contract = RuntimeContract.for_mode(
+            "strict_predictive_cert",
+            predictive_certification=True,
+            enforce_gate_matrix=True,
+        )
+
+        # Single gate: raises immediately if any cert invariant is violated.
+        assert_cert_run_clean(_cert_contract)
+
+        # Mirror into module globals and env for legacy code that still reads them.
+        # Contract is authoritative; these are derived from it, not the other way around.
+        os.environ["MEGASIGNALSOURCE"]        = "pyrecalc"
+        os.environ["MEGA_SIGNAL_SOURCE"]       = "pyrecalc"
+        os.environ["MEGAPREDICTIVECERT"]       = "1"
+        os.environ["MEGA_PREDICTIVE_CERT"]     = "1"
+        os.environ["PREDICTIVE_CERTIFICATION"] = "1"
+        os.environ["STRICTSTRUCTFIELDS"]       = "1"
+        os.environ["STRICT_STRUCT_FIELDS"]     = "1"
+        os.environ["ENFORCEGATEMATRIX"]        = "1"
+        os.environ["ENFORCE_GATE_MATRIX"]      = "1"
+        optimizer.PREDICTIVE_CERTIFICATION = bool(_cert_contract.predictive_certification)
+        optimizer.PARITY_MODE = bool(_cert_contract.parity_mode)
+        optimizer.STRICT_STRUCT_FIELDS = bool(_cert_contract.strict_structural_validation)
+        optimizer.ENFORCE_GATE_MATRIX = bool(_cert_contract.enforce_gate_matrix)
+        run_mode = "autonomous"
+
+        print("\n[PREDICTIVE — ORACLE-BLIND] strict_predictive_cert mode engaged.")
+        print(
+            f"  signal_source={_cert_contract.signal_source} | "
+            f"PREDICTIVE_CERTIFICATION={_cert_contract.predictive_certification} | "
+            f"PARITY_MODE={_cert_contract.parity_mode}"
+        )
+        print(f"  cert_contract: timezone={tz_expected} | optimizer.TIMEZONE={tz_optimizer} | FORENSIC_CHART_TZ={getattr(optimizer, 'FORENSIC_CHART_TZ', '')}")
+
+        # Phase 3: thread _cert_contract explicitly through run_simulation
+        # so simulate_with_contract is called end-to-end with the exact contract.
+        # run_mode is "autonomous" here (cert uses autonomous mechanics).
+        results = analyzer.run_simulation(
+            "strict_predictive_cert",
+            combo_id=args.combo,
+            contract=_cert_contract,
+        )
+        py_trades = results[12]
+
+        # Phase 6A.1 — Use analyzer reconciliation (not positional zip)
+        combo_id = args.combo or getattr(analyzer, "default_combo_id", None)
+
+        # Phase 6A.2 — Oracle selection: primary = tv_ledger; fallback = mapped external list; fail closed.
+        oracle_kind = "tv_ledger"
+        if not getattr(analyzer, "tv_ledger", None):
+            if ext_trades:
+                missing_map = [t for t in ext_trades if t.get("e_bar") is None or t.get("x_bar") is None]
+                ext_trades_mapped = [t for t in ext_trades if t.get("e_bar") is not None and t.get("x_bar") is not None]
+                saved_ledger = analyzer.tv_ledger
+                analyzer.tv_ledger = ext_trades_mapped
+                oracle_kind = "external_list"
+            else:
+                print("[CERT FAIL] strict_predictive_cert: no oracle (no tv_ledger and no --trades_csv). Fail closed.")
+                sys.exit(1)
+        else:
+            ext_trades_mapped = None
+            saved_ledger = None
+
+        matches, scorecard, ghost_trades, targetcount = analyzer.reconcile(py_trades, "strict_predictive_cert")
+
+        # Restore ledger if we swapped
+        if saved_ledger is not None:
+            analyzer.tv_ledger = saved_ledger
+
+        # Phase 6A.3 — PASS condition
+        _no_bad_status = all(
+            not str(r.get("status", "")).startswith(("EXTRA-TV", "GHOST"))
+            for r in scorecard
+        )
+        clean = (
+            targetcount > 0
+            and matches == targetcount
+            and not ghost_trades
+            and _no_bad_status
+        )
+
+        # Phase 6A.4 — First mismatch row on fail
+        bad = None
+        if not clean:
+            for row in scorecard:
+                if str(row.get("status", "")) not in ("MATCH", "OK"):
+                    bad = row
+                    break
+            print("\n[CERT FAIL] strict_predictive_cert: reconciliation failed.")
+            if bad:
+                print(f"  First mismatch: {bad}")
+            sys.exit(1)
+
+
+        # Phase 6B — Build canonical CertificationProof via schema contract (v2.4 Step-0).
+        # All oracle selection, reconciliation, and pass/fail logic is preserved above.
+        tz_val = "Europe/Sofia"
+        if getattr(optimizer, "TIMEZONE", None) and optimizer.TIMEZONE != tz_val:
+            print(f"[CERT FAIL] Timezone metadata mismatch: optimizer.TIMEZONE={optimizer.TIMEZONE!r} expected={tz_val!r}")
+            sys.exit(1)
+
+        ohlcv_path = args.tv
+        params_snap = dict(analyzer.csv_params or {})
+        _tick = max(float(getattr(optimizer, "TICKSIZE", 0.01) or 0.01), 1e-6)
+
+        # 1) Signal source summary — from_runtime sets enforcement flags from actual PREDICTIVE_CERTIFICATION state
+        sig_summary = SignalSourceSummary.from_runtime(
+            signalsource="pyrecalc",
+            predictivecertification=True,
+            oracleblindenforced=bool(getattr(optimizer, "PREDICTIVE_CERTIFICATION", True)),
+            tvsignalreadsblocked=bool(getattr(optimizer, "PREDICTIVE_CERTIFICATION", True)),
+        )
+
+        # 2) Normalize trades using canonical schema-layer normalization (Bundle A).
+        # py_trade_to_record / tv_trade_to_record are the single source of truth;
+        # local variants _py_trade_to_record / _tv_trade_to_record are preserved
+        # for backward compat but new cert paths use canonical functions only.
+        _bars_by_bi = getattr(analyzer, "bars_by_bi", None)
+        _utc_ts     = getattr(optimizer, "_utc_to_chart_ts", None)
+        predicted_trades = normalize_py_trades(
+            py_trades, bars_by_bi=_bars_by_bi, utc_to_chart_ts=_utc_ts
+        )
+        ref_source = analyzer.tv_ledger if oracle_kind == "tv_ledger" else (ext_trades_mapped or [])
+        reference_trades = normalize_tv_trades(ref_source)
+
+        # 3) Stats and mismatches — use exact counts from reconcile(), not scorecard inference
+        recon_stats, mismatch_list = _scorecard_to_stats_and_mismatches(
+            scorecard,
+            tv_count=targetcount,
+            py_count=len(py_trades or []),
+            ghost_count=len(ghost_trades) if ghost_trades else 0,
+            matched_count=matches,   # BUG 13 FIX: pass exact count from reconcile() return
+        )
+
+        # 4) First failing row as typed MismatchDetail (bad is already set above; None on clean pass)
+        first_bad = MismatchDetail.from_scorecard_row(bad) if bad else None
+
+        # 5) Version, inputs, tolerance
+        version = VersionStamp(
+            optimizer_version=str(getattr(optimizer, "OPTIMIZER_VERSION", "unknown")),
+            analyzer_version=str(ANALYZER_VERSION),
+        )
+        tolerance = build_default_tolerance(tick_size=_tick)
+        _config_snap = {
+            "signal_source": "pyrecalc",
+            "predictive_certification": True,
+            "process_orders_on_close": False,
+            "timezone": tz_val,
+            "strict_struct_fields": bool(getattr(optimizer, "STRICT_STRUCT_FIELDS", True)),
+        }
+        inputs = InputFingerprint(
+            ohlcv_hash=hash_file(ohlcv_path) if ohlcv_path else "unknown",
+            params_hash=hash_dict(params_snap),
+            config_hash=hash_dict(_config_snap),
+            combo_id=str(combo_id or ""),
+            timezone=tz_val,
+        )
+
+        # 6) Derive cert kind — raises if sig_summary doesn't support strict predictive
+        cert_kind = resolve_certification_kind(
+            sig_summary, requested_certification=CERT_KIND_STRICT_PREDICTIVE,
+        )
+
+        # 7) Build, validate, write proof — assert_valid_proof_dict is the final fail-closed gate
+        proof_obj = CertificationProof.from_reconciliation(
+            certificationkind=cert_kind,
+            passed=clean,
+            version=version,
+            inputs=inputs,
+            tolerance=tolerance,
+            source=sig_summary,
+            reconciliation=recon_stats,
+            predictedtrades=predicted_trades,
+            referencetrades=reference_trades,
+            mismatches=mismatch_list,
+            firstmismatch=first_bad,
+            referenceoraclekind=oracle_kind,
+            notes=[f"strict_predictive_cert matches={matches} target={targetcount}"],
+            extra={"process_orders_on_close": False,
+                   "ghost_trades": len(ghost_trades) if ghost_trades else 0,
+                   "optimizer_timezone": str(getattr(optimizer, "TIMEZONE", "") or ""),
+                   "forensic_chart_tz": str(getattr(optimizer, "FORENSIC_CHART_TZ", "") or ""),
+                   "timezone": tz_val},
+        )
+
+        proof_dict = proof_obj.to_dict()
+        assert_valid_proof_dict(proof_dict)   # raises ValueError if any invariant violated
+
+        proof_path = f"cert_proof_{combo_id or 'unknown'}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.json"
+        try:
+            with open(proof_path, "w", encoding="utf-8") as fh:
+                json.dump(proof_dict, fh, indent=2, ensure_ascii=False, default=str)
+            print(f"\n[CERT: PASS] strict_predictive_cert: {matches}/{targetcount} trades matched.")
+            print(f"  Proof written → {proof_path}")
+        except Exception as e:
+            print(f"[CERT FAIL] Could not write proof JSON: {e}")
+            sys.exit(1)
+
+        sys.exit(0)
+    # ==========================================================================
+    # END PHASE 6 / 6A / 6B
+    # ==========================================================================
+
     results = analyzer.run_simulation(run_mode, combo_id=args.combo)
     py_trades = results[12]
 
