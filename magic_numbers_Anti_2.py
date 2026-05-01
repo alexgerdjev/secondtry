@@ -493,7 +493,7 @@ def load_combo_row(csv_path: str, combo_id: str) -> Dict[str, str]:
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            row_id = (row.get("ComboID") or "").strip().replace("_", "")
+            row_id = (row.get("ComboID") or row.get("combo_id") or "").strip().replace("_", "")
             if row_id == target_id:
                 return row
     raise SystemExit(f"ComboID {combo_id!r} not found in {csv_path}")
@@ -945,8 +945,8 @@ def main() -> None:
 
     row = load_combo_row(csv_path, args.combo)
     print(f"[+] Loaded {args.combo} from {os.path.basename(csv_path)}")
-    eq_val = row.get('Equity') or row.get('Eq') or row.get('equity')
-    print(f"    Eq={eq_val} PF={row.get('PF')} WR={row.get('WR')} Trades={row.get('Trades')} Score={row.get('Score')}")
+    eq_val = row.get('full_eq') or row.get('Equity') or row.get('Eq') or row.get('equity')
+    print(f"    Eq={eq_val} PF={row.get('full_pf') or row.get('PF')} WR={row.get('full_wr') or row.get('WR')} Trades={row.get('full_trades') or row.get('Trades')} Score={row.get('score') or row.get('Score')}")
 
     with open(args.pine, "r", encoding="utf-8") as f:
         original = f.read()
@@ -1142,16 +1142,22 @@ def main() -> None:
         trades = sim_res[12] or []
 
         def _ts_chart_from_bar_index(bi: int) -> str:
+            """Convert UTC bar time to Sofia local time (Europe/Sofia, UTC+2/+3 DST)."""
+            from datetime import datetime, timedelta
             try:
                 t = bars2[int(bi)].get("time")
             except Exception:
                 return "N/A"
             try:
-                if hasattr(optimizer, "_utc_to_chart_ts"):
-                    return (optimizer._utc_to_chart_ts(t) or "")[:16].replace("T", " ")
+                ts = str(t).replace("T", " ")[:16]
+                dt = datetime.strptime(ts, "%Y-%m-%d %H:%M")
+                # Sofia DST: EEST (UTC+3) until last Sun Oct, EET (UTC+2) from last Sun Oct to last Sun Mar
+                dst_end_2025   = datetime(2025, 10, 26, 1, 0)
+                dst_start_2026 = datetime(2026, 3, 29, 1, 0)
+                offset = 3 if (dt < dst_end_2025 or dt >= dst_start_2026) else 2
+                return (dt + timedelta(hours=offset)).strftime("%Y-%m-%d %H:%M")
             except Exception:
-                pass
-            return str(t).replace("T", " ")[:16]
+                return str(t).replace("T", " ")[:16]
 
         if args.report_trades:
             print(f"\n--- EXPECTED TRADINGVIEW REPORT FOR {combo_id} ---")

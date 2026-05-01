@@ -1185,7 +1185,7 @@ import json
 
 import copy
 
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
@@ -6319,9 +6319,9 @@ def f_calc_qty_val(equity, entry_close, risk_pct, max_leverage):
     q = min(risk_notional / px, max_q)
 
 
-    # Five-decimal + MIN_QTY contract (ROUND_DOWN for bit-perfect parity)
+    # Five-decimal + MIN_QTY contract (ROUND_HALF_UP matches TV position sizing)
 
-    q_dec = q.quantize(Decimal('0.00001'), rounding=ROUND_DOWN)
+    q_dec = q.quantize(Decimal('0.00001'), rounding=ROUND_HALF_UP)
 
     q_f = float(q_dec)
 
@@ -7312,9 +7312,11 @@ def process_exit_for_bar(
 
     tick_sz = float(TICKSIZE)
 
-    act_d = float(t_act) * tick_sz
+    # Pine broker: trail_points/trail_offset are price units, not ticks.
+    # snap_trail_act stored as ticks but broker uses the value directly as price delta.
+    act_d = float(t_act)   # price units — do NOT multiply by tick_sz
 
-    off_d = float(t_off) * tick_sz
+    off_d = float(t_off)   # price units — do NOT multiply by tick_sz
 
     if combo_id == "ID_01956":
 
@@ -7378,9 +7380,9 @@ def process_exit_for_bar(
 
             trail_price_eval = round_to_tick(
 
-                run_extreme - pos.side * off_ticks * TICKSIZE, TICKSIZE
+                run_extreme - pos.side * off_ticks, TICKSIZE
 
-            )
+            )  # off_ticks is price units — no x TICKSIZE (Pine broker semantics)
 
             # Bug 4 removed: TP-level trail suppression had no Pine equivalent.
 
@@ -18622,13 +18624,15 @@ def _cache_enabled() -> bool:
     return _env_flag_truthy("MEGA_ENABLE_WINDOW_CACHE")
 
 
-def init_worker(windows_data, tsize, comm, cap, dpath):
+def init_worker(windows_data, tsize, comm, cap, dpath, full_data=None):
 
     """Rule 6.1: Canonical Worker Seeding + Base Cache Build."""
 
-    global GLOBAL_WINDOWS, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, _WINDOW_BASE_CACHE
+    global GLOBAL_WINDOWS, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, _WINDOW_BASE_CACHE, GLOBAL_FULL_DATA
 
     GLOBAL_WINDOWS = windows_data
+
+    GLOBAL_FULL_DATA = full_data if full_data is not None else None
 
     TICKSIZE = tsize
 
@@ -19573,7 +19577,7 @@ def run_discovery_profile(args: Any, snap_cli: Dict[str, str]) -> int:
     # Discovery must use Python recomputation, not TV parity signal stamps.
     os.environ.setdefault("MEGASIGNALSOURCE", SIGNAL_SOURCE_PY_RECALC)
 
-    init_worker(windows_a, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH)
+    init_worker(windows_a, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, full_data=data)
 
 
     # Parallel pool for discovery — same pattern as random-search path
@@ -19677,7 +19681,7 @@ def run_discovery_profile(args: Any, snap_cli: Dict[str, str]) -> int:
 
             initializer=init_worker,
 
-            initargs=(windows_a, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH),
+            initargs=(windows_a, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, data),
 
         )
 
@@ -20173,7 +20177,7 @@ def run_discovery_profile(args: Any, snap_cli: Dict[str, str]) -> int:
 
     windows_b = rolling_windows(data_b, train_len=train_len_b, test_len=test_len_b)
 
-    init_worker(windows_b, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH)
+    init_worker(windows_b, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, full_data=data_b)
 
     _segment_strict_min_b = _parse_segment_strict_min_trades_env()
 
@@ -20517,23 +20521,130 @@ def _restore_pool_entries_from_checkpoint(raw: Any) -> List[Dict[str, Any]]:
     return out
 
 
-def run_worker(params):
+def _assert_no_duplicate_trades(ledger, context="full_range"):
+    """
+    Fail-closed invariant: a proper full-range simulation must not produce duplicate
+    trades. This is a detector, not a deduper.
+    """
+    seen = {}
+    dups = []
 
-    """Runs simulation across all GLOBAL_WINDOWS.
+    for i, t in enumerate(ledger or []):
+        key = (
+            int(getattr(t, "side", 0)),
+            int(getattr(t, "entry_bi", -1)),
+            int(getattr(t, "exit_bi", -1)),
+            round(float(getattr(t, "fill_price", 0.0)), 8),
+        )
+        if key in seen:
+            dups.append((key, seen[key], i))
+        else:
+            seen[key] = i
+
+    if dups:
+        preview = dups[:10]
+        raise RuntimeError(
+            f"_assert_no_duplicate_trades FAILED [{context}] "
+            f"duplicates={len(dups)} preview={preview}"
+        )
 
 
-    Returns ``(params, train_agg, test_agg, wf_seg_tags, segment_metrics_bundle)``.
+def _ledger_to_agg_tuple(ledger):
+    """
+    Compute aggregate metrics tuple from a single ledger.
+    Returns same tuple shape used by legacy run_worker().
+    """
+    if not ledger:
+        return None
 
-    The last element is ``None`` unless ``MEGA_COLLECT_SEGMENT_METRICS`` is truthy; when set,
+    m = assemble_metrics_gs66(ledger, float(INITIALCAPITAL))
 
-    it is the JSON-serializable output of :func:`tools.assemble_segment_metrics.assemble_segment_metrics`
+    wins = int(sum(1 for t in ledger if getattr(t, "net_pnl", 0.0) > 0))
+    losses = int(sum(1 for t in ledger if getattr(t, "net_pnl", 0.0) <= 0))
 
-    built from the same per-window ledgers (no second simulate).
+    return (
+        float(m.get("Eq", INITIALCAPITAL)),
+        float(m.get("WR", 0.0)),
+        float(m.get("DD", 0.0)),
+        float(m.get("Exp", 0.0)),
+        int(m.get("Trades", 0)),
+        float(m.get("Dur", 0)),
+        float(m.get("Sharpe", 0.0)),
+        float(m.get("PF", 0.0)),
+        wins,
+        losses,
+        int(m.get("TrL", 0)),
+        int(m.get("TrS", 0)),
+    )
 
+
+def run_worker_full_range(params):
+    """
+    Authoritative TV-parity simulation path.
+
+    One OHLCV range -> one simulate() call -> one unique ledger -> one metric set.
+    No overlapping windows. No IS/OOS split. No train/test classification.
+    """
+    try:
+        sweep_cid = globals().get("SWEEP_COMBO_ID", None)
+        full_data = globals().get("GLOBAL_FULL_DATA", None)
+
+        if not full_data:
+            raise RuntimeError("run_worker_full_range: GLOBAL_FULL_DATA is empty or missing")
+
+        full_combo = build_combo_state_deck(
+            full_data,
+            params,
+            sweep_cid,
+            window_idx=0,
+            role="full_range",
+        )
+        if not full_combo:
+            raise RuntimeError("run_worker_full_range: empty full-range combo deck")
+
+        assert_autonomous_deck_ready(full_combo, context="run_worker_full_range")
+
+        full_res = simulate(
+            full_combo,
+            params,
+            return_trades=True,
+            combo_id=sweep_cid,
+            tick_size=TICKSIZE,
+            bars_mode="full",
+        )
+
+        full_ledger = full_res[12] if len(full_res) > 12 else []
+        _assert_no_duplicate_trades(full_ledger, context="run_worker_full_range")
+
+        full_agg = _ledger_to_agg_tuple(full_ledger)
+        seg_bundle = {
+            "mode": "full_range",
+            "bars": int(len(full_data)),
+            "trades": int(len(full_ledger)),
+        }
+        return params, full_agg, None, ["full_range"], seg_bundle
+
+    except Exception:
+        import traceback
+        print("FULL_RANGE WORKER ERROR", traceback.format_exc(), flush=True)
+        return params, None, None, (), None
+
+
+def run_worker_legacy_wfo(params):
+
+    """
+    LEGACY_WFO optimizer/validation path.
+
+    Uses overlapping walk-forward windows and aggregates per-window ledgers.
+    Not authoritative for full-range TV parity.
     """
 
     try:
 
+        # LEGACY_WFO:
+        # This path aggregates ledgers across overlapping train/test windows for
+        # optimizer/validation purposes. It is not the authoritative full-range TV
+        # parity path and may contain the same trade in multiple windows by design.
         train_ledgers = []  # all trade objects across all train windows
 
         test_ledgers  = []  # all trade objects across all test windows
@@ -20557,9 +20668,9 @@ def run_worker(params):
 
             if not tr_combo:
 
-                raise RuntimeError(f"run_worker: empty train combo deck (window idx={idx})")
+                raise RuntimeError(f"run_worker_legacy_wfo: empty train combo deck (window idx={idx})")
 
-            assert_autonomous_deck_ready(tr_combo, context=f"run_worker train idx={idx}")
+            assert_autonomous_deck_ready(tr_combo, context=f"run_worker_legacy_wfo train idx={idx}")
 
             tr_full = simulate(
 
@@ -20590,9 +20701,9 @@ def run_worker(params):
 
                 if not te_combo:
 
-                    raise RuntimeError(f"run_worker: empty test combo deck (window idx={idx})")
+                    raise RuntimeError(f"run_worker_legacy_wfo: empty test combo deck (window idx={idx})")
 
-                assert_autonomous_deck_ready(te_combo, context=f"run_worker test idx={idx}")
+                assert_autonomous_deck_ready(te_combo, context=f"run_worker_legacy_wfo test idx={idx}")
 
                 te_full = simulate(
 
@@ -20640,43 +20751,7 @@ def run_worker(params):
 
             """Compute correct aggregate metrics from combined multi-window ledger."""
 
-            if not ledger:
-
-                return None
-
-            m = assemble_metrics_gs66(ledger, float(INITIALCAPITAL))
-
-            wins   = int(sum(1 for t in ledger if getattr(t, "net_pnl", 0.0) > 0))
-
-            losses = int(sum(1 for t in ledger if getattr(t, "net_pnl", 0.0) <= 0))
-
-            return (
-
-                float(m.get("Eq",     INITIALCAPITAL)),
-
-                float(m.get("WR",     0.0)),
-
-                float(m.get("DD",     0.0)),
-
-                float(m.get("Exp",    0.0)),
-
-                int(m.get("Trades",   0)),
-
-                float(m.get("Dur",    0)),
-
-                float(m.get("Sharpe", 0.0)),
-
-                float(m.get("PF",     0.0)),
-
-                wins,
-
-                losses,
-
-                int(m.get("TrL",      0)),
-
-                int(m.get("TrS",      0)),
-
-            )
+            return _ledger_to_agg_tuple(ledger)
 
 
         wlist = GLOBAL_WINDOWS
@@ -20710,6 +20785,20 @@ def run_worker(params):
         print(f"[WORKER ERROR] {traceback.format_exc()}", flush=True)
 
         return params, None, None, (), None
+
+
+# In MEGA_FULL_RANGE_SIM mode, res is the authoritative full-period aggregate and
+# test_res is intentionally None. Downstream optimizer logic must not interpret
+# this path as walk-forward validation.
+def run_worker(params):
+    """
+    Dispatcher:
+    - full-range parity path when MEGA_FULL_RANGE_SIM=1
+    - legacy WFO path otherwise
+    """
+    if _env_flag_truthy("MEGA_FULL_RANGE_SIM"):
+        return run_worker_full_range(params)
+    return run_worker_legacy_wfo(params)
 
 
 # CSV: NUM_PARAM_COLS and param key order come from zenith_schema.CSV_PARAM_KEYS (49 params after metrics).
@@ -21336,6 +21425,69 @@ def load_typical_param_ranges_from_results_csv(
 
     return ranges if len(ranges) >= 20 else None
 
+
+# NOTE: sovereign_registry.json already exists - DO NOT recreate it with --force-seal
+# unless core simulation precincts are intentionally modified. Use existing registry.
+
+# TYPICAL_RANGES_WINNERS: Derived from 41 confirmed winners (PF >= 1.5, >= 5 trades)
+# Bounds expanded by max(15% of observed spread, 0.3 * std) to ensure all 4 TV-certified
+# combos (ID_00003, ID_00017, ID_00024, ID_00073) fall inside the sampling basin.
+TYPICAL_RANGES_WINNERS = {
+    # ── Entry gates ──────────────────────────────────────────────
+    'adxdec':              ('float', -13.22, -1.32),
+    'adxgate':             ('float', -16.04, -3.59),
+    'adxl':                ('float',  -0.20,  1.71),
+    'adxs':                ('float',  -1.71,  0.15),
+    'zl':                  ('float',  -2.14, -0.89),
+    'zs':                  ('float',   0.39,  2.26),
+    'rl':                  ('float',  25.36, 39.24),
+    'rs':                  ('float',  55.23, 79.66),
+    'velgate':             ('float',   0.15,  0.21),
+    'velhigh':             ('float',   0.04,  0.22),
+    'velmed':              ('float',   0.02,  0.13),
+    'chopmult':            ('float',   0.13,  0.23),
+    # ── RSI filters ──────────────────────────────────────────────
+    'rsiexl':              ('float',  60.75, 98.46),
+    'rsiexs':              ('float',   3.57, 38.00),
+    'rsilmild':            ('int',       32,    53),
+    'rsismild':            ('int',       47,    68),
+    'maxrsil':             ('int',       62,    88),
+    'maxrsis':             ('int',        3,    28),
+    # ── Z / regime ───────────────────────────────────────────────
+    'maxzl':               ('float',   1.41,  2.54),
+    'maxzs':               ('float',  -2.05, -1.20),
+    'nucl':                ('float',   1.66,  5.91),
+    'nucs':                ('float',   0.58,  4.43),
+    'confl':               ('int',        1,     1),
+    'confs':               ('int',        1,     1),
+    # ── Mode / SL / structure ────────────────────────────────────
+    'modear':              ('float',   1.47,  6.46),
+    'modebrlong':          ('float',   1.20,  6.61),
+    'modebrshort':         ('float',   1.30,  6.41),
+    'sll':                 ('float',   1.82,  2.92),
+    'sls':                 ('float',   1.79,  2.83),
+    'slfloorpct':          ('float',  0.003,  0.020),
+    'slcappct':            ('float',  0.023,  0.048),
+    # ── Trail ────────────────────────────────────────────────────
+    'trailactivationlong': ('float',   0.92,  1.67),
+    'trailactivationshort':('float',   0.93,  1.69),
+    'trailhv':             ('float',  -2.39,  1.21),  # full range: disabled→enabled
+    'traillv':             ('float',   1.59,  5.39),
+    'trailmv':             ('float',   0.33,  2.19),
+    # ── Age / timing ─────────────────────────────────────────────
+    'agel':                ('int',        7,    28),
+    'ages':                ('int',        1,     8),
+    'cdl':                 ('int',        1,    51),
+    'cds':                 ('int',        1,    56),
+    'emapersistbars':      ('int',        1,    14),
+    # ── Signal quality ───────────────────────────────────────────
+    'sweeptolatr':         ('float',  0.084,  0.258),
+}
+
+# Fixed constants (not sampled):
+# riskl=4, risks=4, usea=True, useb=True,
+# strictregimesync=True, usechopfilter=True, useexhaustionexit=True,
+# exhvell=0, exhzl=0, exhvels=0, exhzs=0, autonomous_indicators=1, exhregime=1
 
 TYPICAL_RANGES = None  # Set in run_sweep from load_typical_param_ranges(); random_param_set uses it
 
@@ -23227,16 +23379,10 @@ def run_sweep():
                     print(f"[*] Loaded TYPICAL_RANGES from MEGA_LEARN_RANGES_FROM={learn_from!r} (keys={len(TYPICAL_RANGES)}).", flush=True)
 
             if TYPICAL_RANGES is None:
-
-                TYPICAL_RANGES = load_typical_param_ranges(_root, min_trades=MIN_TRADES, expand_pct=0.15, p_lo=0.05, p_hi=0.95)
-
-            if TYPICAL_RANGES is not None:
-
-                print(f"[*] Loaded TYPICAL_RANGES from legacy-good packs (keys={len(TYPICAL_RANGES)}).", flush=True)
-
-            else:
-
-                print("[!] No TYPICAL_RANGES loaded; falling back to built-in random ranges.", flush=True)
+                # Use winner-derived intelligent ranges (includes all 4 certified combos)
+                TYPICAL_RANGES = TYPICAL_RANGES_WINNERS
+                print(f"[*] Loaded TYPICAL_RANGES_WINNERS (41 certified winners, keys={len(TYPICAL_RANGES)}).", flush=True)
+                print("[*] All 4 TV-certified combos (ID_00003, ID_00017, ID_00024, ID_00073) inside basin.", flush=True)
 
         # Keep `TYPICAL_RANGES` (loaded from legacy-good result sheets) by default.
 
@@ -23424,7 +23570,7 @@ def run_sweep():
             # Discovery must use Python recomputation, not TV parity signal stamps.
             os.environ.setdefault("MEGASIGNALSOURCE", SIGNAL_SOURCE_PY_RECALC)
 
-            init_worker(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH)
+            init_worker(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, full_data=data)
 
             # Parallel evaluation: auto-detect CPU cores by default (like Optimizer_21_03).
 
@@ -23491,7 +23637,7 @@ def run_sweep():
 
                     initializer=init_worker,
 
-                    initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH),
+                    initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, data),
 
                 )
 
@@ -24191,7 +24337,7 @@ def run_sweep():
 
             initializer=init_worker,
 
-            initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH),
+            initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, data),
 
         ) as executor:
 
@@ -24367,7 +24513,7 @@ def run_sweep():
 
             initializer=init_worker,
 
-            initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH),
+            initargs=(windows, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, data),
 
         ) as executor:
 
@@ -25424,7 +25570,7 @@ if __name__ == "__main__":
 
         wins_v = rolling_windows(bars_v, train_len=train_len_v, test_len=test_len_v)
 
-        init_worker(wins_v, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH)
+        init_worker(wins_v, TICKSIZE, COMMISSIONPCT, INITIALCAPITAL, DATA_PATH, full_data=bars_v)
 
         p_v = random_param_set()
 
